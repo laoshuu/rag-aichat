@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Env / secrets
+.env
+.env.*
+
+# Models, indexes, generated data
+models/
+*.gguf
+*.bin
+*.safetensors
+index/
+*.faiss
+chroma/
+*.sqlite3
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Claude Code local settings
+.claude/settings.local.json
