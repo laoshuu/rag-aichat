@@ -3,8 +3,7 @@
 A log of the architectural decisions behind this project, kept as prep for the code review.
 
 **Status legend**
-- `accepted — deep-dive pending`: agreed in a quick design round. Ryan has not yet challenged it in depth, and it may still change.
-- `accepted`: discussed in depth. Ryan can defend it.
+- `accepted`: the current design. Decisions stay **open to change while building**. If implementation shows a better option, update the entry (or supersede it) and note what we learned.
 - `superseded by D-XXX`: replaced by a later decision.
 
 Facts marked **[verify]** come from documentation or memory and have not yet been checked against the real system. Confirm each one when we build that component.
@@ -20,7 +19,7 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
                                  ~400 tok)        nomic-embed-text)
 
                      CHAT (interactive, `rag-chat chat`)
- user question ─┬─► query = prev question + current ─► embedder ─► NumPy cosine search
+ user question ─┬─► q = 0.8·embed(current) + 0.2·embed(prev) ─► NumPy cosine search
                 │                                                       │ ranked chunks
                 │                                                       ▼
                 │   history (sliding window) ──────────────► prompt builder (6,144-token budget,
@@ -38,7 +37,7 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
 | System prompt | ~300 | Fixed text, measured once. |
 | Chat history | ≤ 1,024 | Sliding window (D-009). |
 | Safety margin | ~200 | Chat-template tokens and counting error. |
-| **Retrieved context** | **≈ 3,596** | Whatever is left. Filled best-first (D-015). |
+| **Retrieved context** | **≤ 3,596** | Whatever is left. Filled best-first with relevant chunks only (D-015). This is a ceiling, not a target. |
 | **Total** | **6,144** | Sent as `num_ctx` on every request. |
 
 ---
@@ -46,7 +45,7 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
 ## Foundations
 
 ### D-001: Language: Python
-- **Status:** accepted — deep-dive pending
+- **Status:** accepted
 - **Context:** We need first-class bindings for local LLM runtimes, embedding models and vector stores.
 - **Options considered:**
   - **Python.** Pros: every RAG building block has a mature Python library (Ollama client, llama-cpp-python, sentence-transformers, NumPy, FAISS); it's the ML lingua franca, so reviewers will expect it; fast to iterate in. Cons: slower than compiled languages, and dependency management takes some care.
@@ -59,7 +58,8 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
   - *"Isn't Python slow?"* Our code mostly waits on I/O and does a NumPy matrix multiply. More than 95% of latency is token generation inside Ollama, which is C++/Metal.
 
 ### D-002: LLM runtime: Ollama
-- **Status:** accepted — deep-dive pending
+- **Status:** accepted (deep-dive 2026-11-19)
+- **Key insight from the deep-dive:** Ollama and llama-cpp-python run the **same engine** (llama.cpp/ggml on Metal) with essentially the same speed and quality. The choice is about **how much of the stack around the engine we own**, not about performance. Ollama takes on model loading, memory management, crash isolation, installation and downloads, and keeps the model in memory across app restarts (a faster development loop). The price is silent truncation and the lack of a built-in tokenizer, both handled in D-010.
 - **Context:** The LLM must run locally on an Apple M2 Pro with 16 GB of unified memory. Most local runtimes run quantized **GGUF** models through **llama.cpp**, which uses the Apple GPU via Metal. The real question is how our app talks to llama.cpp.
 - **Options considered:**
   - **Ollama.** A local server wrapping llama.cpp, with a REST API on `localhost:11434`.
@@ -78,15 +78,20 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
     - Pros: very user-friendly.
     - Cons: GUI-driven, so hard to script and reproduce. Closed source.
 - **Decision:** Ollama.
-- **Why:** The lowest-risk path to a working demo for someone new to local LLMs. It separates model serving from application logic cleanly, and reviewers can reproduce it with `ollama pull`. Its two weaknesses (context size and token counting) are things we take on explicitly, and they make good review talking points.
-- **Trade-offs accepted:** We own 6K enforcement: `num_ctx` on every call plus our own exact token counting, with a test that the assembled prompt is always ≤ 6,144 tokens. We give up the in-process `tokenize()` that llama-cpp-python would provide.
+- **Why:** The most convenient option for development, and the lowest-risk path to a working demo for someone new to local LLMs. It separates model serving from application logic cleanly, and reviewers can reproduce it with `ollama pull`. Its two weaknesses (context size and token counting) are things we take on explicitly, and they make good review talking points.
+- **Trade-offs accepted:**
+  - **We own 6K enforcement.** `num_ctx` comes from a single config constant on every call, because a request with a different value makes Ollama reload the model. Our own exact counting, plus a test, guarantees the assembled prompt is always ≤ 6,144 − 1,024 tokens.
+  - **Silent truncation.** Mitigated by the budget guard (prevention) and a `prompt_eval_count` check after each response (detection). See D-010.
+  - **A separate tokenizer file** instead of llama-cpp-python's built-in `tokenize()`. Note that token counting itself is *not* a cost of Ollama: we need counts to budget chunks with any runtime.
+  - Not a cost: speed. The HTTP hop takes milliseconds next to seconds of generation.
+- **When llama-cpp-python would win:** if exact in-process control (built-in tokenizer, loud overflow errors, custom sampling or grammars) mattered more than convenient setup, or if we were shipping a single desktop app without a separate service.
 - **Likely reviewer questions:**
   - *"The model supports 32K natively. How do you guarantee 6K?"* Two layers. (1) The runtime layer: `num_ctx=6144` on every request means the KV cache is physically 6K. (2) The application layer: the prompt builder counts tokens exactly and never assembles more than 6,144 − 1,024 (the answer reserve) tokens. A unit test asserts this.
   - *"What happens if you overflow?"* Ollama silently truncates, the system prompt gets dropped, and the model stops following grounding rules. That's why we enforce the limit *before* sending rather than relying on the runtime.
   - *"Why not llama.cpp directly?"* We'd gain exact tokenization in-process, but take on the compile risk and model-file management. Ollama is llama.cpp underneath, so performance is the same.
 
 ### D-003: No RAG framework; we write the pipeline ourselves
-- **Status:** accepted — deep-dive pending
+- **Status:** accepted
 - **Context:** LangChain and LlamaIndex supply loaders, splitters, vector stores and prompt assembly.
 - **Options considered:**
   - **Our own pipeline.** Pros: every step is visible and explainable; exact control over what enters the 6K prompt; few dependencies; easy to test. Cons: more code to write and own; we re-implement things like text splitting.
@@ -99,7 +104,7 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
   - *"Isn't this reinventing the wheel?"* The wheel here is a few hundred lines. In exchange we control the token budget exactly and can explain every line. For production at scale, I'd look again at a framework or a vector DB.
 
 ### D-004: Corpus scale: small
-- **Status:** accepted — deep-dive pending
+- **Status:** accepted
 - **Context:** Corpus size drives the choice of vector store, ingestion design and performance work.
 - **Options considered:** small demo corpus (tens of files, a few MB); reviewer-supplied files at demo time; large (thousands of files).
 - **Decision:** Small: tens of files that we curate (see D-022).
@@ -109,7 +114,7 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
   - *"What if I drop in 10,000 files?"* Ingestion slows down linearly because embedding is the bottleneck, and brute-force search still works up to about 100K chunks. Beyond that we'd move to FAISS/HNSW and incremental indexing.
 
 ### D-005: Interface: CLI chat
-- **Status:** accepted — deep-dive pending
+- **Status:** accepted
 - **Options considered:**
   - **CLI.** Pros: smallest; no web framework; easy to script and test. Cons: less visual polish.
   - **Streamlit/Gradio web UI.** Pros: chat bubbles, file uploads, looks polished. Cons: extra framework, and Streamlit's rerun-the-script model complicates state.
@@ -124,7 +129,7 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
 ## Model layer
 
 ### D-006: Chat model: `qwen2.5:7b-instruct` (Q4_K_M)
-- **Status:** accepted — deep-dive pending
+- **Status:** accepted
 - **Context:** The model must fit in 16 GB alongside the OS and the embedding model, run fast enough for a live demo, and stick to the provided context.
 - **Memory math:** 7B parameters at ~4.5 bits each ≈ 4.7 GB of weights. KV cache at 6K tokens for Qwen2.5-7B (28 layers, 4 KV heads × 128 dims, fp16) ≈ 2 × 28 × 4 × 128 × 2 bytes ≈ 56 KB per token × 6,144 ≈ **~340 MB**. Total ≈ 5–5.5 GB, which fits comfortably.
 - **Options considered:**
@@ -141,7 +146,7 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
   - *"Why not a bigger model?"* Memory and latency on a 16 GB laptop. A 7B model with good retrieval beats a 14B model that stutters in a demo.
 
 ### D-007: Embeddings: `nomic-embed-text` via Ollama
-- **Status:** accepted — deep-dive pending
+- **Status:** accepted
 - **Context:** Retrieval needs a local model that turns text into vectors whose cosine similarity reflects meaning.
 - **Options considered:**
   - **nomic-embed-text (Ollama).** Pros: reuses the runtime we already run; no PyTorch (~2 GB) install; 768-dim vectors; long input limit (trained to 8K tokens; the limit Ollama actually applies is **[verify]**). Cons: needs task prefixes (`search_document: ` when indexing, `search_query: ` when searching), and forgetting them quietly degrades retrieval. An HTTP call per batch.
@@ -155,7 +160,7 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
   - *"Why cosine similarity?"* It compares direction and ignores length. We L2-normalize vectors once at ingest, so cosine becomes a plain dot product.
 
 ### D-008: Vector store: NumPy brute-force
-- **Status:** accepted — deep-dive pending
+- **Status:** accepted
 - **Options considered:**
   - **NumPy.** An `N×768` float32 matrix plus a parallel list of chunk metadata. Pros: exact search; ~30 lines; no extra dependencies; easy to reason about and test. Cons: O(N) per query; we write persistence ourselves; no metadata filtering.
   - **ChromaDB.** Pros: persistence, metadata filtering, a real DB API. Cons: a dependency plus an abstraction this scale doesn't need.
@@ -172,7 +177,7 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
 ## Context budget (the 6K constraint)
 
 ### D-009: Chat history: token-bounded sliding window
-- **Status:** accepted — deep-dive pending
+- **Status:** accepted
 - **Options considered:**
   - **Sliding window.** Keep the newest turns that fit in ≤ 1,024 tokens and drop the oldest first. Pros: simple, predictable, testable. Cons: older context is lost completely.
   - **Stateless.** Pros: maximum room for retrieved context. Cons: breaks follow-up questions, and this is billed as a chat app.
@@ -184,29 +189,38 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
   - *"What if a single turn exceeds the history budget?"* It gets dropped, or truncated if we add that. History is the first thing to give way, because the documents are the point of RAG.
 
 ### D-010: Token counting: Qwen2.5's tokenizer, run locally
-- **Status:** accepted — deep-dive pending
-- **Context:** Ollama has no public tokenize endpoint, and overflow is silent (D-002), so we need exact counts *before* sending.
+- **Status:** accepted (amended after the D-002 deep-dive)
+- **Context:** We count tokens for **two separate reasons**:
+  1. **Budgeting:** the prompt builder must know how many chunks fit (D-015). This applies with *any* runtime.
+  2. **Overflow protection:** Ollama has no public tokenize endpoint and truncates silently (D-002), so we must guarantee the prompt fits *before* sending.
 - **Options considered:**
   - **Exact.** Load Qwen2.5's `tokenizer.json` with the Hugging Face `tokenizers` library (a Rust core, lightweight, no PyTorch). Pros: exact counts. Cons: one dependency; a one-time download at setup (it then runs offline, like the model weights); tied to the model family.
   - **Heuristic (chars ÷ 4 + margin).** Pros: no dependencies. Cons: badly wrong for code, tables and non-English text (Chinese is roughly one token per character), which can push the prompt past 6K.
   - **Measure afterwards (`prompt_eval_count`).** Pros: ground truth from Ollama. Cons: only detects overflow after it happens.
-- **Decision:** The exact tokenizer as the guard, with `prompt_eval_count` logged as a cross-check in debug mode.
-- **Why:** Exact counts make the 6K guarantee provable rather than approximate.
+- **Measured evidence (Qwen2.5 tokenizer, 2026-11-19):** prose 6.54 chars/token · code 3.35 · Markdown table 2.29 · Chinese 1.44, a **4.5× spread**. chars ÷ 4 over-estimates prose and under-estimates tables (~1.7×) and Chinese (~2.8×). Numbers are tokenized digit by digit (`128K` → 4 tokens). `<|im_start|>` is a single special token (id 151644).
+- **Decision:** Two lines of defence:
+  1. **Prevention.** The exact Qwen2.5 tokenizer counts every piece of the prompt, and the prompt builder never exceeds the budget.
+  2. **Detection.** After each response, compare Ollama's `prompt_eval_count` with our expected count. If Ollama processed noticeably fewer tokens, it truncated: log a loud warning. If the two persistently disagree by more than the per-message template estimate, the tokenizer file doesn't match the running model (drift).
+- **Tokenizer ↔ model coupling:** the config sets the chat model and its tokenizer side by side. Changing the model without changing the tokenizer is a bug the detection check should catch.
+- **Caveat [verify before relying on detection]:** Ollama reuses its KV cache when consecutive prompts share a prefix (our system prompt always does). In some versions `prompt_eval_count` may then report only the *newly evaluated* tokens, not the full prompt, which would make the check fire false alarms. Test with two consecutive requests. If confirmed, either compare only on cache-cold requests or detect truncation another way.
+- **Why:** Exact counts make the 6K guarantee provable rather than approximate, and the detection check turns Ollama's silent failure mode into a visible one.
 - **Subtlety:** Ollama wraps each message in Qwen's ChatML template (`<|im_start|>role\n … <|im_end|>\n`), which adds a few tokens per message. Our counter must add this overhead per message, and the 200-token margin absorbs any remaining error. We'll measure the overhead against `prompt_eval_count` **[verify]**.
 - **Likely reviewer questions:**
   - *"Is downloading a tokenizer still 'fully local'?"* Yes. It's a static file fetched once at setup, the same as the model weights. Nothing goes over the network at runtime.
   - *"How do you know your count matches Ollama's?"* We compare our count with `prompt_eval_count` on real requests, and a test fails if they drift beyond the margin.
 
 ### D-011: Budget allocation: fixed caps
-- **Status:** accepted — deep-dive pending
+- **Status:** accepted
 - **Options considered:**
   - **Fixed caps** (see the table at the top). Pros: predictable, easy to explain and unit-test. Cons: any unused history allowance is wasted rather than given to context.
   - **Dynamic, context first.** Pros: uses every token. Cons: history can vanish entirely on queries with many relevant chunks, and behaviour is harder to predict.
   - **Dynamic, history first.** Pros: good for long chats. Cons: starves retrieval, and documents are the point of a RAG app.
 - **Decision:** Fixed caps: answer 1,024 · system ~300 · history ≤ 1,024 · margin ~200 · context ≈ 3,596.
 - **Why:** Each slot has a clear owner and a hard limit. That makes "how do you stay under 6K?" a one-line answer, and the property easy to test.
-- **Trade-offs accepted:** We leave tokens unused when history is short. A natural refinement, if needed, is to let context borrow unused history tokens.
+- **Principle: the budget is a ceiling, not a target** (added 2026-11-20). Unused tokens are not handed to another slot. A shorter prompt means faster prefill, which is the real benefit of filtering out irrelevant chunks (D-015). We considered letting history borrow tokens that context leaves unused, and rejected it: it would mean more stale conversation *and* slower answers.
+- **Trade-offs accepted:** We leave tokens unused when history or context is short. That's deliberate (see the principle above).
 - **Likely reviewer questions:**
+  - *"Why not use every available token?"* Prefill time grows with prompt length (on an M2 Pro, a ~5K-token prompt may take around 10 s before the first token **[verify]**). Tokens with no relevant information cost latency and can distract the model.
   - *"Why reserve 1,024 tokens for the answer?"* In llama.cpp, generated tokens occupy the same context window as the prompt. If the prompt took all 6,144 tokens, the model would have no room to answer. 1,024 tokens is roughly 700 words, plenty for a grounded answer.
   - *"Why does context get the largest share?"* Answer quality in RAG depends mostly on whether the right passage is in the prompt.
 
@@ -215,7 +229,7 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
 ## Retrieval
 
 ### D-012: Ingestion: a separate `ingest` command with an on-disk index
-- **Status:** accepted — deep-dive pending
+- **Status:** accepted
 - **Options considered:**
   - **`ingest` command writing `index/vectors.npy` + `index/chunks.json`.** Pros: separates indexing from querying; chat starts instantly; the index can be inspected. Cons: the index can go stale if files change and nobody re-runs ingest.
   - **Rebuild on every start.** Pros: never stale; no files. Cons: re-embeds everything on every launch, so the demo starts with a wait.
@@ -226,58 +240,64 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
 - **Likely reviewer questions:**
   - *"What happens if I edit a file?"* Re-run `ingest`, and chat warns you if you forget. Incremental indexing by content hash is the upgrade path.
 
-### D-013: Retrieval query: previous user question + current question
-- **Status:** accepted — deep-dive pending
-- **Context:** A follow-up like "what about its limitations?" has no subject, so embedding it alone retrieves noise.
+### D-013: Retrieval query: weighted blend of current and previous question
+- **Status:** accepted (revised 2026-11-20: was "previous + current question as joined text")
+- **Context:** A follow-up like "what about its limitations?" has no subject, so embedding it alone retrieves noise. But adding the previous question can drag retrieval back to the *old* topic when the user changes subject.
 - **Options considered:**
-  - **Previous + current question.** Pros: no extra LLM call; resolves most pronoun follow-ups. Cons: when the user switches topic, the old topic biases retrieval.
+  - **Joined text** (embed `previous + "\n" + current`). Pros: one embedding call; resolves pronoun follow-ups. Cons: the two questions carry equal weight, so **topic switches retrieve the old topic**. Toy example: after "How do I turn on sync?", the question "When does it launch?" ranked the *Enable sync* chunk (0.62) above the launch-date chunk (0.52).
+  - **Weighted vectors.** Embed each question separately, then `q = normalize(w·q_curr + (1−w)·q_prev)`. Pros: the current question dominates when it has its own topic, and the previous one fills in a missing subject. In the same toy example at w = 0.8, both the topic switch (launch-date chunk first, 0.67) and the pronoun follow-up (*Limits* chunk first, 0.85) work. Cons: a second embedding call (~20 ms) and one parameter to tune.
   - **Raw current question.** Pros: simplest. Cons: fails on follow-ups, which reviewers will try.
-  - **LLM rewrites the question to stand alone.** Pros: most accurate. Cons: an extra LLM call (~1–3 s), another prompt to budget, and the rewrite can itself go wrong.
-- **Decision:** Embed `previous_user_question + "\n" + current_question` (on the first turn, just the current question).
-- **Why:** A cheap heuristic that covers the common case.
-- **Trade-offs accepted:** Topic switches get a slightly blurred query. If the eval or demo shows this hurts, we upgrade to LLM rewriting.
+  - **LLM rewrites the question to stand alone.** Pros: most accurate, and handles chains of vague follow-ups. Cons: an extra LLM call (~1–3 s), another prompt to budget, and the rewrite can itself go wrong.
+- **Decision:** Weighted vectors: `q = normalize(w·embed(current) + (1−w)·embed(previous))`, starting at **w = 0.8**, tuned on the eval set (D-019). On the first turn, `q = embed(current)`.
+- **Why:** It fixes the topic-switch failure of joined text at almost no cost, and makes the trade-off between "current" and "context" one explicit, tunable number.
+- **Trade-offs accepted:** If the *previous* question was itself vague, its vector adds noise rather than a subject. LLM rewriting is the upgrade path if the eval shows this matters.
 - **Likely reviewer questions:**
   - *"Why not use the whole history?"* Older turns increasingly blur the query. The previous question alone carries most of the reference.
+  - *"Why is averaging vectors meaningful?"* Embeddings live in a space where direction encodes meaning. A weighted sum points *between* the two topics, closer to the heavier one. We renormalize so cosine scores stay comparable.
+  - *"How did you choose 0.8?"* Starting value, then tuned on eval questions that include both follow-ups and topic switches.
 
 ### D-014: Chunking: structure-aware, ~400 tokens, ~50 overlap, heading-path prefix
-- **Status:** accepted — deep-dive pending
+- **Status:** accepted
 - **Options considered:**
   - **Structure-aware.** Split on Markdown headings, then paragraphs, then sentences, packing pieces up to ~400 tokens. Overlap of ~50 tokens applies only when a section is cut into several chunks. Pros: chunks are coherent units. The heading prefix (`Guide > Install > macOS`) restores context a chunk would otherwise lose. Code blocks and tables stay whole where possible. Cons: more code; edge cases (headings inside code fences, very long paragraphs).
   - **Fixed token windows.** Pros: simplest. Cons: cuts mid-sentence, mid-code-block and mid-table, and chunks lose their section context.
   - **Smaller (~200 tokens).** Pros: more precise matches, and about 15 fit in the budget. Cons: each chunk has less surrounding context for the LLM.
 - **Decision:** Structure-aware, ~400 tokens with ~50 overlap. `.txt` files have no headings, so they fall back to paragraph/sentence splitting with the filename as the prefix.
-- **Why:** About 400 tokens is big enough to hold a full explanation and small enough that 6–8 chunks fit in about 3.6K, which gives retrieval several chances to hit.
+- **Why:** About 400 tokens is big enough to hold a full explanation and small enough that 6–8 chunks fit in about 3.6K, which gives retrieval several chances to hit. There's also a deeper reason: **pooling dilutes meaning.** The embedding model runs attention over every token (a tokens × 768 matrix), then *averages* the rows into one vector. A chunk covering install + sync + pricing becomes a blurry average that matches none of those questions strongly. (Toy example: a mixed chunk scored ~0.62 against "How do I turn on sync?", while a focused sync chunk scored 0.97.) Smaller, single-topic chunks give sharper vectors.
 - **Trade-offs accepted:** 400 is a starting point, not a measured optimum. We'll test 200 vs 400 vs 600 with the retrieval eval (D-019).
 - **Likely reviewer questions:**
   - *"Why overlap?"* So a fact that straddles a cut point appears whole in at least one chunk.
   - *"Why prefix the heading path?"* A chunk under `## Limitations` doesn't say *what* it's describing the limitations of. The prefix gets embedded with the text, so the chunk can be retrieved by topic.
 
-### D-015: Chunk selection: fill the context budget best-first
-- **Status:** accepted — deep-dive pending
+### D-015: Chunk selection: best-first, filtered by relevance, capped by budget
+- **Status:** accepted (revised 2026-11-20: was "fill until the budget is full")
+- **Context:** In the walkthrough example, "fill until full" let an irrelevant *Install* chunk (score 0.30) into a question about sync, just because there was room. That adds noise and makes prefill slower.
 - **Options considered:**
-  - **Fill by score until ~3,596 tokens (at most 8 chunks).** Pros: uses the budget fully and adapts to chunk lengths. Cons: low-relevance chunks can get in when only a couple are truly relevant.
-  - **Fixed k = 4.** Pros: simplest to explain. Cons: wastes budget on short chunks, or needs an overflow check for long ones anyway.
-  - **Over-fetch 20 + cross-encoder rerank.** Pros: better precision. Cons: a second model plus PyTorch, overkill for a small corpus.
-- **Decision:** Rank by cosine score and add chunks best-first while they fit. A chunk that doesn't fit is skipped and the next one tried, up to 8.
-- **Why:** The budget, not an arbitrary k, is the real constraint, and the token counter we already have provides the stopping rule.
-- **Trade-offs accepted:** No reranking. Weakly related chunks can add noise. The grounding prompt (D-016) tells the model to ignore irrelevant context.
+  - **Fill by score until ~3,596 tokens.** Pros: uses the budget fully. Cons: always sends the maximum prompt (the slowest prefill) and lets in irrelevant chunks.
+  - **Absolute score floor** (e.g. keep score ≥ 0.5). Pros: detects "nothing relevant at all". Cons: cosine scores have no absolute scale; the right number depends on the embedding model and corpus.
+  - **Relative cutoff** (keep score ≥ top − δ). Pros: adapts to each query's score range. Cons: when nothing is relevant it still keeps the "best of the bad".
+  - **Fixed k = 4.** Pros: simplest to explain. Cons: ignores both relevance and chunk length.
+  - **Over-fetch 20 + cross-encoder rerank.** Pros: best precision. Cons: a second model plus PyTorch, overkill for a small corpus.
+- **Decision:** Rank by cosine score. Add chunks best-first **while score ≥ floor AND score ≥ top − δ**, stopping at the context budget (~3,596 tokens) or 8 chunks, whichever comes first. A chunk that doesn't fit the remaining budget is skipped and the next one tried. Floor and δ start as guesses and are **tuned on the eval set** (D-019). Example (scores 0.97 / 0.82 / 0.41 / 0.30, δ = 0.2): only the first two pass.
+- **Why:** The budget is a ceiling, not a target (D-011). Relevance decides what gets in, and the budget only guarantees we never overflow. The floor catches "nothing relevant", and the relative cutoff handles per-query score scales.
+- **Trade-offs accepted:** Two parameters to tune, and a cutoff set too strict can drop a useful chunk. If no chunk passes the floor, the prompt has no context, and the model must say it doesn't know (D-016).
 - **Likely reviewer questions:**
   - *"What about 'lost in the middle'?"* LLMs pay most attention to the start and end of the context. With only 6–8 chunks the effect is small, and putting the best chunk closest to the question is a cheap fix. (Chunk order within the prompt is a detail we'll settle while building.)
 
 ### D-016: No relevant match: grounding by prompt only
-- **Status:** accepted — deep-dive pending
+- **Status:** accepted
 - **Options considered:**
   - **Prompt only.** Always pass the best chunks, and instruct the model to answer only from the context and otherwise say it doesn't know. Pros: no threshold to tune. Cons: a 7B model sometimes answers from its own knowledge anyway.
   - **Similarity threshold → refuse.** Pros: deterministic. Cons: cosine thresholds are specific to the model and corpus, and set too high, they refuse good questions.
   - **Threshold → answer but flag it.** Pros: friendly. Cons: blurs the RAG guarantee.
-- **Decision:** Grounding by prompt only.
-- **Why:** The simplest approach with no tuning. The fictional `.txt` docs (D-022) give us a direct test of whether the model sticks to context.
-- **Trade-offs accepted:** Occasional answers from outside the documents. If testing shows it's frequent, we add a threshold calibrated on the eval set.
+- **Decision:** Grounding by prompt, **plus the relevance floor from D-015** (amended 2026-11-20). If no chunk passes the floor, we send no context, and the system prompt tells the model to say it doesn't know from the documents.
+- **Why:** The prompt handles the common case. The floor, calibrated on the eval set, removes irrelevant chunks the model might otherwise wrongly build an answer from. The fictional `.txt` docs (D-022) give us a direct test of whether the model sticks to context.
+- **Trade-offs accepted:** A 7B model may still occasionally answer from its own knowledge, even with empty context. If testing shows that's frequent, the CLI could skip the LLM and reply "nothing relevant found" when no chunk passes.
 - **Likely reviewer questions:**
   - *"How do you stop hallucinations?"* We reduce them: a strict system prompt, sources shown under each answer, and fictional docs to test grounding. Prompting can't fully prevent them, and a score threshold is the next layer.
 
 ### D-017: Sources: a list printed after each answer
-- **Status:** accepted — deep-dive pending
+- **Status:** accepted
 - **Options considered:**
   - **Source list from metadata.** Pros: zero tokens; can't be hallucinated. Cons: shows what was *retrieved*, not necessarily what was *used*.
   - **Inline `[n]` citations.** Pros: links each claim to its source. Cons: 7B models often misnumber or skip them; costs instruction tokens.
@@ -291,7 +311,7 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
 ## Engineering
 
 ### D-018: Code layout: a package with one module per stage
-- **Status:** accepted — deep-dive pending
+- **Status:** accepted
 - **Options considered:**
   - **`rag_chat/` package** (`config`, `loaders`, `chunker`, `tokens`, `embedder`, `store`, `retriever`, `prompt`, `llm`, `cli`). Pros: each stage testable in isolation; the review walkthrough follows the data flow. Cons: more files.
   - **Single script.** Pros: fastest start. Cons: hard to test and hard to walk through.
@@ -301,24 +321,24 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
   - *"How would you swap Ollama for llama.cpp?"* Only `llm.py`, `embedder.py` and (for counting) `tokens.py` know about Ollama, so the change stays inside those modules.
 
 ### D-019: Testing: pytest unit tests + retrieval eval
-- **Status:** accepted — deep-dive pending
+- **Status:** accepted
 - **Options considered:**
   - **Unit tests + retrieval eval.** Pros: proves the deterministic properties hold, and gives evidence for tuning choices. Cons: writing about 15 eval questions takes time.
   - **Unit tests only.** Pros: less work. Cons: chunk size and k stay guesses.
   - **Also an LLM-judged answer eval.** Pros: measures answer faithfulness. Cons: slow and noisy with a 7B judge; a big extra build.
-- **Decision:** pytest for the chunker, tokenizer budget (**the assembled prompt never exceeds 6,144 − 1,024**), history window and store. Plus `eval/questions.jsonl` with about 15 questions, each labelled with its expected source file, scored as **hit-rate@k**.
-- **Why:** Gives evidence for the claim that we stay under 6K and for the chunk size.
+- **Decision:** pytest for the chunker, tokenizer budget (**the assembled prompt never exceeds 6,144 − 1,024**), history window and store. Plus `eval/questions.jsonl` with about 15 questions, each labelled with its expected source file, scored as **hit-rate@k**. The eval set must include **follow-up questions and topic switches** (short conversations, not just single questions), plus a few **unanswerable questions**. Together these tune the query weight `w` (D-013) and the relevance floor and `δ` (D-015).
+- **Why:** Gives evidence for the claim that we stay under 6K, and turns the guessed numbers (chunk size, `w`, floor, `δ`) into measured ones.
 - **Likely reviewer questions:**
   - *"How did you pick 400 tokens?"* We ran the eval at 200, 400 and 600 and compared hit-rates. The numbers go here once we have them.
 
 ### D-020: Streaming output
-- **Status:** accepted — deep-dive pending
+- **Status:** accepted
 - **Decision:** Stream tokens from Ollama (`stream: true`) and print them as they arrive. Sources print after the stream ends.
 - **Why:** A 300–1,000-token answer at ~25 tok/s takes 12–40 s. Without streaming the demo shows a frozen terminal. Streaming also improves time to the first token, which is how users perceive latency.
 - **Trade-offs accepted:** Slightly more complex code: handling partial chunks, Ctrl-C mid-stream, and errors mid-stream.
 
 ### D-021: Setup: venv + pinned `requirements.txt`
-- **Status:** accepted — deep-dive pending
+- **Status:** accepted
 - **Options considered:**
   - **venv + pinned requirements.** Pros: standard, needs no extra tools. Cons: no lockfile for transitive dependencies (fine with so few dependencies).
   - **pyproject + uv.** Pros: fast and reproducible. Cons: reviewers need uv installed.
@@ -326,7 +346,7 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
 - **Decision:** venv + pinned `requirements.txt`. Setup steps: install Ollama → `ollama pull qwen2.5:7b-instruct nomic-embed-text` → venv + `pip install` → a one-time tokenizer download → `ingest` → `chat`.
 
 ### D-022: Demo corpus: public Markdown docs + fictional `.txt` notes
-- **Status:** accepted — deep-dive pending (revised: originally public docs only)
+- **Status:** accepted (revised: originally public docs only)
 - **Context:** The demo must show both `.md` **and** `.txt` ingestion, and must prove that answers come from retrieval rather than from the model's training data.
 - **Options considered:**
   - **Public docs only.** Pros: realistic Markdown structure. Cons: no `.txt` files; Qwen may already know these docs, so a correct answer doesn't prove retrieval worked.
