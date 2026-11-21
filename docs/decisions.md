@@ -36,8 +36,8 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
 | Answer (generation) | 1,024 | Enforced by `num_predict`. Generated tokens share the context window with the prompt. |
 | System prompt | ~300 | Fixed text, measured once. |
 | Chat history | ≤ 1,024 | Sliding window (D-009). |
-| Safety margin | ~200 | Chat-template tokens and counting error. |
-| **Retrieved context** | **≤ 3,596** | Whatever is left. Filled best-first with relevant chunks only (D-015). This is a ceiling, not a target. |
+| Safety margin | ~50 | Counting is exact (`Σ content + 5·messages + 3`, measured), so this only covers small edits such as a longer system prompt. Reduced from ~200 on 2026-11-21. |
+| **Retrieved context** | **≤ 3,746** | Whatever is left. Filled best-first with relevant chunks only (D-015). This is a ceiling, not a target. |
 | **Total** | **6,144** | Sent as `num_ctx` on every request. |
 
 ---
@@ -64,10 +64,10 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
 - **Options considered:**
   - **Ollama.** A local server wrapping llama.cpp, with a REST API on `localhost:11434`.
     - Pros: one-command install. `ollama pull <model>` handles downloads, quantization variants and chat templates. Metal acceleration is automatic. The model runs as a **separate process**, so the app is a thin HTTP client and models swap with one config value. Easy for reviewers to reproduce. It also serves embeddings (D-007), so one runtime covers both.
-    - Cons: a background service is one more moving part. **No public tokenize endpoint**, so we count tokens ourselves (D-010). Its **default context window is smaller than 6K** (2,048 or 4,096 depending on version **[verify]**), so we must send `num_ctx: 6144` with every request. When a prompt overflows, Ollama **truncates it silently** (only a server-side log warning) and drops early prompt content, which is where our system prompt sits **[verify behaviour empirically]**. We also give up some low-level control (sampling internals, KV-cache reuse).
+    - Cons: a background service is one more moving part. **No public tokenize endpoint**, so we count tokens ourselves (D-010). Its **default context window is 4,096** (measured, Ollama 0.40.16), so we must send `num_ctx: 6144` with every request. When a prompt overflows, Ollama **truncates it silently** (HTTP 200, no error), **keeping only the last ~num_ctx/2 tokens** whatever the size of the overflow, so the start goes, which is where our system prompt sits. Measured at num_ctx = 6,144: prompts of 6,362 / 7,095 / 9,066 / 12,092 tokens all kept exactly 3,074. A prompt that fits but leaves no room for the answer is also silently context-shifted during generation (see `experiments/README.md` §3). We also give up some low-level control (sampling internals, KV-cache reuse).
   - **llama-cpp-python.** Python bindings that run llama.cpp **inside our process**.
     - Pros: `Llama(n_ctx=6144)` sets the window directly. **`llm.tokenize()` gives exact counts with the exact model tokenizer**, with no extra dependency. No separate service to run, and full control over sampling.
-    - Cons: the pip install compiles C++ with Metal flags, which can fail on some machines (a demo risk; prebuilt Metal wheels exist but their availability varies **[verify]**). We download GGUF files by hand from Hugging Face and pick the quantization ourselves. Our app manages the model's lifecycle and memory, and the model loads on every app start (several seconds). Chat templates are more manual.
+    - Cons: the pip install compiles C++ with Metal flags, which can fail on some machines (a demo risk; prebuilt Metal wheels exist but their availability varies; not tested, since we didn't choose this option). We download GGUF files by hand from Hugging Face and pick the quantization ourselves. Our app manages the model's lifecycle and memory, and the model loads on every app start (several seconds). Chat templates are more manual.
   - **llama.cpp's `llama-server` (raw).** The upstream C++ HTTP server, with an OpenAI-compatible API.
     - Pros: no wrapper, the most control, and it exposes a `/tokenize` endpoint.
     - Cons: you build or install it and manage GGUF files and flags yourself. It's essentially "Ollama without the conveniences".
@@ -139,7 +139,7 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
   - **gemma3:4b.** Pros: about 3 GB and faster. Cons: weaker at strict grounding and at saying "I don't know".
   - Larger (12–14B). Pros: better quality. Cons: about 8–9 GB of weights on a 16 GB machine; slower generation and memory pressure in a live demo.
 - **Decision:** `qwen2.5:7b-instruct`, configurable.
-- **Why:** The best balance of grounding quality, speed (roughly 20–30 tok/s expected on an M2 Pro **[verify]**) and a predictable token budget.
+- **Why:** The best balance of grounding quality, speed (measured on the M2 Pro: decode 33–38 tok/s, prefill ~280 tok/s; native context 32,768, which we cap at 6,144) and a predictable token budget.
 - **Trade-offs accepted:** The tokenizer is tied to the model family. Switching to a non-Qwen model means switching the tokenizer file too (D-010).
 - **Likely reviewer questions:**
   - *"Why 4-bit quantization? Doesn't it hurt quality?"* Q4_K_M is the usual sweet spot. Quality loss compared with fp16 is small for 7B models, and it cuts memory by about 3.5×.
@@ -149,7 +149,7 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
 - **Status:** accepted
 - **Context:** Retrieval needs a local model that turns text into vectors whose cosine similarity reflects meaning.
 - **Options considered:**
-  - **nomic-embed-text (Ollama).** Pros: reuses the runtime we already run; no PyTorch (~2 GB) install; 768-dim vectors; long input limit (trained to 8K tokens; the limit Ollama actually applies is **[verify]**). Cons: needs task prefixes (`search_document: ` when indexing, `search_query: ` when searching), and forgetting them quietly degrades retrieval. An HTTP call per batch.
+  - **nomic-embed-text (Ollama).** Pros: reuses the runtime we already run; no PyTorch (~2 GB) install; 768-dim vectors; input limit of **2,048 nomic tokens in Ollama, silently truncated** beyond that (measured), far above our ~400-token chunks. Vectors come back already L2-normalized; throughput ≈ 56 chunks/s. Cons: needs task prefixes (`search_document: ` when indexing, `search_query: ` when searching), and forgetting them quietly degrades retrieval. An HTTP call per batch.
   - **sentence-transformers (bge-small, all-MiniLM-L6-v2).** Pros: in-process, hugely popular, many model choices. Cons: PyTorch dependency; a second model-loading path; MiniLM truncates input at 256 tokens.
   - **mxbai-embed-large (Ollama).** Pros: stronger on benchmarks; 1024-dim. Cons: a **512-token input limit** caps chunk size, and it's larger and slower.
 - **Decision:** `nomic-embed-text` through Ollama's embed API.
@@ -184,7 +184,7 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
   - **Rolling summary.** Pros: keeps long-range memory. Cons: an extra LLM call per turn (slow on a laptop); summaries can drop or distort facts; another prompt to budget.
 - **Decision:** Sliding window over whole (user, assistant) turn pairs, capped at 1,024 tokens, counting template overhead.
 - **Why:** Short demo conversations fit easily, and the behaviour is deterministic and easy to explain.
-- **Trade-offs accepted:** A long answer (up to 1,024 tokens) can push all earlier turns out of the window. If that shows up in testing, we can store a truncated version of long assistant answers in history.
+- **Trade-offs accepted:** A long answer (up to 1,024 tokens) can push all earlier turns out of the window. If that shows up in testing, we can store a truncated version of long assistant answers in history. **Cache interaction:** history sits right after the system prompt (D-011 prompt order). When the window drops its oldest turn, the history changes near the start of the prompt, so that turn gets almost no prefix-cache benefit. Turns where nothing is dropped reuse system + history.
 - **Likely reviewer questions:**
   - *"What if a single turn exceeds the history budget?"* It gets dropped, or truncated if we add that. History is the first thing to give way, because the documents are the point of RAG.
 
@@ -202,12 +202,12 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
   1. **Prevention.** The exact Qwen2.5 tokenizer counts every piece of the prompt, and the prompt builder never exceeds the budget.
   2. **Detection.** After each response, compare Ollama's `prompt_eval_count` with our expected count. If Ollama processed noticeably fewer tokens, it truncated: log a loud warning. If the two persistently disagree by more than the per-message template estimate, the tokenizer file doesn't match the running model (drift).
 - **Tokenizer ↔ model coupling:** the config sets the chat model and its tokenizer side by side. Changing the model without changing the tokenizer is a bug the detection check should catch.
-- **Caveat [verify before relying on detection]:** Ollama reuses its KV cache when consecutive prompts share a prefix (our system prompt always does). In some versions `prompt_eval_count` may then report only the *newly evaluated* tokens, not the full prompt, which would make the check fire false alarms. Test with two consecutive requests. If confirmed, either compare only on cache-cold requests or detect truncation another way.
+- **Caching caveat: resolved (measured).** In Ollama 0.40.16, `prompt_eval_count` always reports the **full** prompt, even when most of it is served from the prefix cache. The cached part is reported separately as `prompt_eval_cached_count`. So the detection check is reliable on every request.
 - **Why:** Exact counts make the 6K guarantee provable rather than approximate, and the detection check turns Ollama's silent failure mode into a visible one.
-- **Subtlety:** Ollama wraps each message in Qwen's ChatML template (`<|im_start|>role\n … <|im_end|>\n`), which adds a few tokens per message. Our counter must add this overhead per message, and the 200-token margin absorbs any remaining error. We'll measure the overhead against `prompt_eval_count` **[verify]**.
+- **Subtlety:** Ollama wraps each message in Qwen's ChatML template (`<|im_start|>role\n … <|im_end|>\n`), which adds overhead. **Measured: exactly 5 tokens per message + 3** for the trailing assistant header, so `prompt_tokens = Σ count(content) + 5·n_messages + 3`. That matched `prompt_eval_count` exactly. Without a system message, Qwen's template injects a default one (+21 tokens), so we always send our own.
 - **Likely reviewer questions:**
   - *"Is downloading a tokenizer still 'fully local'?"* Yes. It's a static file fetched once at setup, the same as the model weights. Nothing goes over the network at runtime.
-  - *"How do you know your count matches Ollama's?"* We compare our count with `prompt_eval_count` on real requests, and a test fails if they drift beyond the margin.
+  - *"How do you know your count matches Ollama's?"* We compare our count with `prompt_eval_count` on real requests, and a test fails if they drift beyond the margin. Measured in M0: once the `5·n_messages + 3` template overhead is added, they match **exactly**.
 
 ### D-011: Budget allocation: fixed caps
 - **Status:** accepted
@@ -215,13 +215,14 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
   - **Fixed caps** (see the table at the top). Pros: predictable, easy to explain and unit-test. Cons: any unused history allowance is wasted rather than given to context.
   - **Dynamic, context first.** Pros: uses every token. Cons: history can vanish entirely on queries with many relevant chunks, and behaviour is harder to predict.
   - **Dynamic, history first.** Pros: good for long chats. Cons: starves retrieval, and documents are the point of a RAG app.
-- **Decision:** Fixed caps: answer 1,024 · system ~300 · history ≤ 1,024 · margin ~200 · context ≈ 3,596.
+- **Decision:** Fixed caps: answer 1,024 · system ~300 · history ≤ 1,024 · margin ~50 · context ≤ 3,746. (Revised 2026-11-21: the margin went from ~200 to ~50 once M0 showed our counts are exact. We considered lowering the context ceiling to ~2,500 for faster answers and kept it; the relevance filter (D-015) is what keeps typical prompts short.)
+- **Prompt order (added 2026-11-21): `system → history → context + question`.** Ollama reuses its KV cache for the longest identical **prefix** of consecutive prompts, and recomputes everything after the first changed token (measured: a one-word change at 75% depth → 75% cached and prefill 10.8 s → 2.8 s; at 25% depth → 26% cached). System and history are identical from one turn to the next, so putting them first makes them a cached prefix. Only the new context and question pay prefill. Putting context before history would break the prefix every turn and force history to be recomputed.
 - **Why:** Each slot has a clear owner and a hard limit. That makes "how do you stay under 6K?" a one-line answer, and the property easy to test.
 - **Principle: the budget is a ceiling, not a target** (added 2026-11-20). Unused tokens are not handed to another slot. A shorter prompt means faster prefill, which is the real benefit of filtering out irrelevant chunks (D-015). We considered letting history borrow tokens that context leaves unused, and rejected it: it would mean more stale conversation *and* slower answers.
 - **Trade-offs accepted:** We leave tokens unused when history or context is short. That's deliberate (see the principle above).
 - **Likely reviewer questions:**
-  - *"Why not use every available token?"* Prefill time grows with prompt length (on an M2 Pro, a ~5K-token prompt may take around 10 s before the first token **[verify]**). Tokens with no relevant information cost latency and can distract the model.
-  - *"Why reserve 1,024 tokens for the answer?"* In llama.cpp, generated tokens occupy the same context window as the prompt. If the prompt took all 6,144 tokens, the model would have no room to answer. 1,024 tokens is roughly 700 words, plenty for a grounded answer.
+  - *"Why not use every available token?"* Prefill time grows with prompt length (measured on the M2 Pro: prefill ≈ 280 tok/s, so a ~5K-token prompt takes **~18.6 s** before the first token). Tokens with no relevant information cost latency and can distract the model.
+  - *"Why reserve 1,024 tokens for the answer?"* Generated tokens occupy the same context window as the prompt. **Measured:** a 6,022-token prompt with `num_predict=300` still generated 300 tokens. Ollama silently evicted the *start* of the prompt mid-answer (context shifting) to make room, which is where the system prompt sits. Keeping prompt ≤ 6,144 − `num_predict` guarantees that never happens. 1,024 tokens is roughly 700 words, plenty for a grounded answer.
   - *"Why does context get the largest share?"* Answer quality in RAG depends mostly on whether the right passage is in the prompt.
 
 ---
@@ -273,12 +274,12 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
 - **Status:** accepted (revised 2026-11-20: was "fill until the budget is full")
 - **Context:** In the walkthrough example, "fill until full" let an irrelevant *Install* chunk (score 0.30) into a question about sync, just because there was room. That adds noise and makes prefill slower.
 - **Options considered:**
-  - **Fill by score until ~3,596 tokens.** Pros: uses the budget fully. Cons: always sends the maximum prompt (the slowest prefill) and lets in irrelevant chunks.
+  - **Fill by score until the context cap (~3,746 tokens).** Pros: uses the budget fully. Cons: always sends the maximum prompt (the slowest prefill) and lets in irrelevant chunks.
   - **Absolute score floor** (e.g. keep score ≥ 0.5). Pros: detects "nothing relevant at all". Cons: cosine scores have no absolute scale; the right number depends on the embedding model and corpus.
   - **Relative cutoff** (keep score ≥ top − δ). Pros: adapts to each query's score range. Cons: when nothing is relevant it still keeps the "best of the bad".
   - **Fixed k = 4.** Pros: simplest to explain. Cons: ignores both relevance and chunk length.
   - **Over-fetch 20 + cross-encoder rerank.** Pros: best precision. Cons: a second model plus PyTorch, overkill for a small corpus.
-- **Decision:** Rank by cosine score. Add chunks best-first **while score ≥ floor AND score ≥ top − δ**, stopping at the context budget (~3,596 tokens) or 8 chunks, whichever comes first. A chunk that doesn't fit the remaining budget is skipped and the next one tried. Floor and δ start as guesses and are **tuned on the eval set** (D-019). Example (scores 0.97 / 0.82 / 0.41 / 0.30, δ = 0.2): only the first two pass.
+- **Decision:** Rank by cosine score. Add chunks best-first **while score ≥ floor AND score ≥ top − δ**, stopping at the context budget (~3,746 tokens) or 8 chunks, whichever comes first. A chunk that doesn't fit the remaining budget is skipped and the next one tried. Floor and δ start as guesses and are **tuned on the eval set** (D-019). Example (scores 0.97 / 0.82 / 0.41 / 0.30, δ = 0.2): only the first two pass.
 - **Why:** The budget is a ceiling, not a target (D-011). Relevance decides what gets in, and the budget only guarantees we never overflow. The floor catches "nothing relevant", and the relative cutoff handles per-query score scales.
 - **Trade-offs accepted:** Two parameters to tune, and a cutoff set too strict can drop a useful chunk. If no chunk passes the floor, the prompt has no context, and the model must say it doesn't know (D-016).
 - **Likely reviewer questions:**

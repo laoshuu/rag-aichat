@@ -1,9 +1,7 @@
 from tokenizers import Tokenizer
 
-# 1. 下載並載入 Qwen2.5-7B-Instruct 的 tokenizer（首次執行會自動下載並快取）
 tokenizer = Tokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
 
-# 2. 準備四種不同類型的測試文本
 samples = {
     "Prose Paragraph (英文散文)": (
         "Tokenization is the foundational step in natural language processing, "
@@ -24,14 +22,19 @@ samples = {
 }
 
 # 3. 逐一進行編碼並印出統計數據與切分結果
-for label, text in samples.items():
-    enc = tokenizer.encode(text)
-    
-    num_tokens = len(enc.ids)
-    chars_per_token = len(text) / num_tokens
-    
-    print(f"=== {label} ===")
-    print(f"Token 數量 (len(enc.ids))          : {num_tokens}")
-    print(f"平均每 Token 字元數 (chars/token)  : {chars_per_token:.2f}")
-    print(f"切分結果 (enc.tokens)              : {enc.tokens}")
-    print()
+def print_token_stats():
+    """encode each text and print tokenization results and statistics"""
+    for label, text in samples.items():
+        enc = tokenizer.encode(text)
+        
+        num_tokens = len(enc.ids)
+        chars_per_token = len(text) / num_tokens
+        
+        print(f"=== {label} ===")
+        print(f"Token 數量 (len(enc.ids))          : {num_tokens}")
+        print(f"平均每 Token 字元數 (chars/token)  : {chars_per_token:.2f}")
+        print(f"切分結果 (enc.tokens)              : {enc.tokens}")
+        print()
+
+if __name__ == "__main__":
+    print_token_stats()
