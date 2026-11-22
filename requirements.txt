@@ -1,0 +1,7 @@
+# Runtime
+numpy==2.4.6         # vector store: brute-force cosine search (D-012)
+requests==2.34.2     # HTTP client for the local Ollama server (D-002)
+tokenizers==0.23.3   # exact Qwen2.5 token counts for the budget (D-010)
+
+# Development
+pytest==9.2.0

@@ -201,6 +201,7 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
 - **Decision:** Two lines of defence:
   1. **Prevention.** The exact Qwen2.5 tokenizer counts every piece of the prompt, and the prompt builder never exceeds the budget.
   2. **Detection.** After each response, compare Ollama's `prompt_eval_count` with our expected count. If Ollama processed noticeably fewer tokens, it truncated: log a loud warning. If the two persistently disagree by more than the per-message template estimate, the tokenizer file doesn't match the running model (drift).
+- **Loading (agreed 2026-11-21, M1):** `tokens.py` loads the tokenizer once with `Tokenizer.from_file(config.TOKENIZER_PATH)`, from a local `tokenizer.json` that a one-time setup step downloads at a **pinned revision** into a gitignored `models/` folder. We rejected `Tokenizer.from_pretrained(...)` (used in the experiments): it can contact the Hugging Face Hub every time it runs unless `HF_HUB_OFFLINE` is set, which weakens the "fully local at runtime" claim and could stop chat from starting offline. We also rejected committing the file to git, because it's a generated artifact. Besides `count(text)`, `tokens.py` provides the message-level formula `Σ count(content) + 5·n_messages + 3`. It's the only module that knows which tokenizer is in use.
 - **Tokenizer ↔ model coupling:** the config sets the chat model and its tokenizer side by side. Changing the model without changing the tokenizer is a bug the detection check should catch.
 - **Caching caveat: resolved (measured).** In Ollama 0.40.16, `prompt_eval_count` always reports the **full** prompt, even when most of it is served from the prefix cache. The cached part is reported separately as `prompt_eval_cached_count`. So the detection check is reliable on every request.
 - **Why:** Exact counts make the 6K guarantee provable rather than approximate, and the detection check turns Ollama's silent failure mode into a visible one.
@@ -218,6 +219,7 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
 - **Decision:** Fixed caps: answer 1,024 · system ~300 · history ≤ 1,024 · margin ~50 · context ≤ 3,746. (Revised 2026-11-21: the margin went from ~200 to ~50 once M0 showed our counts are exact. We considered lowering the context ceiling to ~2,500 for faster answers and kept it; the relevance filter (D-015) is what keeps typical prompts short.)
 - **Prompt order (added 2026-11-21): `system → history → context + question`.** Ollama reuses its KV cache for the longest identical **prefix** of consecutive prompts, and recomputes everything after the first changed token (measured: a one-word change at 75% depth → 75% cached and prefill 10.8 s → 2.8 s; at 25% depth → 26% cached). System and history are identical from one turn to the next, so putting them first makes them a cached prefix. Only the new context and question pay prefill. Putting context before history would break the prefix every turn and force history to be recomputed.
 - **Why:** Each slot has a clear owner and a hard limit. That makes "how do you stay under 6K?" a one-line answer, and the property easy to test.
+- **Where the caps and the system prompt live (agreed 2026-11-21, M1):** every cap is a constant in `config.py` (constants only, no logic). That includes `SYSTEM_PROMPT_CAP = 300`, so the whole budget can be read in one place. The system prompt **text** lives in `prompt.py` (M3), next to the code that assembles the prompt. We rejected putting it in `config.py` (a long prose string in a constants file) and in a separate `prompts/system.txt` (an extra file and path for a single prompt).
 - **Principle: the budget is a ceiling, not a target** (added 2026-11-20). Unused tokens are not handed to another slot. A shorter prompt means faster prefill, which is the real benefit of filtering out irrelevant chunks (D-015). We considered letting history borrow tokens that context leaves unused, and rejected it: it would mean more stale conversation *and* slower answers.
 - **Trade-offs accepted:** We leave tokens unused when history or context is short. That's deliberate (see the principle above).
 - **Likely reviewer questions:**
@@ -266,9 +268,21 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
 - **Decision:** Structure-aware, ~400 tokens with ~50 overlap. `.txt` files have no headings, so they fall back to paragraph/sentence splitting with the filename as the prefix.
 - **Why:** About 400 tokens is big enough to hold a full explanation and small enough that 6–8 chunks fit in about 3.6K, which gives retrieval several chances to hit. There's also a deeper reason: **pooling dilutes meaning.** The embedding model runs attention over every token (a tokens × 768 matrix), then *averages* the rows into one vector. A chunk covering install + sync + pricing becomes a blurry average that matches none of those questions strongly. (Toy example: a mixed chunk scored ~0.62 against "How do I turn on sync?", while a focused sync chunk scored 0.97.) Smaller, single-topic chunks give sharper vectors.
 - **Trade-offs accepted:** 400 is a starting point, not a measured optimum. We'll test 200 vs 400 vs 600 with the retrieval eval (D-019).
+- **Implementation details (agreed 2026-11-21, M1):**
+  - **Data shape.** `chunk(Document) -> list[Chunk]` is a pure function: no disk access, no embeddings. `Chunk(source, heading_path: list[str], text, n_tokens)`. Each field has a reader: `source` is used by the sources list (D-017); `heading_path` by the embedded prefix and the sources list; `text` by the embedder and the prompt; `n_tokens` by budget packing (D-015). The string that gets embedded and put in the prompt is *derived*: `" > ".join(heading_path) + "\n" + text`. It isn't stored, so prefix and body can't drift apart.
+  - **`n_tokens` counts prefix + body** (Qwen tokens), because that's what enters the prompt. Counting only the body would under-count by about 12 tokens per chunk; across 8 chunks that's bigger than the 50-token margin, and the result would be silent context shifting (D-011). `n_tokens` is a *packing estimate*. `prompt.py` still counts the fully assembled messages for the final guarantee (token counts aren't exactly additive across concatenation, and separators cost tokens).
+  - **Heading detection.** A line is a heading if it starts with 1–6 `#` followed by a space. A heading stack gives the path: a level-N heading pops the stack down to N−1 entries, then pushes itself.
+  - **Code fences are atomic.** An `in_fence` flag (toggled by lines starting with `` ``` `` or `~~~`) turns off **both** heading detection and paragraph splitting inside fences. Otherwise `# install deps` in a bash block becomes a fake heading, and a blank line between two functions breaks the block into two broken fences. The section is scanned once into **blocks** (paragraphs and fenced code).
+  - **Split order:** heading → block → sentence → **hard Qwen-token split as a last resort** for a single block still over ~400 tokens (e.g. a large table or code block). This guarantees every chunk is at most about 400 tokens + prefix.
+  - **Sentences:** a regex split after `.`, `!` or `?` followed by whitespace. Abbreviations (`e.g.`) cause early cuts. That's harmless, because the pieces are re-packed up to ~400 tokens.
+  - **Overlap:** the **whole trailing sentences** of the previous chunk that fit in ≤50 tokens, so the overlap stays readable. If the last sentence alone is over 50 tokens, that cut gets no overlap.
+  - **No heading above the text** (`.md` preamble, `.md` with no headings, every `.txt`): `heading_path = [filename]`. Otherwise the path holds headings only, with no filename.
+  - Options rejected: storing `full_text` as a field (duplicated data); keeping oversized blocks whole (a 4,000-token table exceeds the 3,746 context cap and could **never** be retrieved); exact last-50-token overlap (chunks start mid-sentence); `pysbd`/`nltk` (a dependency to protect cut points that re-packing makes almost irrelevant); always prepending the filename (costs tokens and usually repeats the H1).
 - **Likely reviewer questions:**
   - *"Why overlap?"* So a fact that straddles a cut point appears whole in at least one chunk.
   - *"Why prefix the heading path?"* A chunk under `## Limitations` doesn't say *what* it's describing the limitations of. The prefix gets embedded with the text, so the chunk can be retrieved by topic.
+  - *"Isn't the hard token split exactly the fixed-window approach you rejected?"* No. Fixed windows are rejected **as the default**. Here almost all text is cut at headings, blocks and sentences, and only a single block too big to split any other way reaches the token split. Kept whole, it couldn't fit the context cap and would be unreachable. *"A half-table you can retrieve beats a whole table you can't."* The next step would be splitting tables on row boundaries and repeating the header row.
+  - *"Your chunks are 400 tokens by the wrong tokenizer. nomic embeds them."* Chunk size exists to fit the **LLM's** prompt, so it's measured in Qwen tokens. nomic only needs the chunk to fit its input window, which is far larger. **[verify] in M2:** nomic's effective window in Ollama, and that `/api/embed`'s `prompt_eval_count` shows no chunk is truncated.
 
 ### D-015: Chunk selection: best-first, filtered by relevance, capped by budget
 - **Status:** accepted (revised 2026-11-20: was "fill until the budget is full")
@@ -344,7 +358,7 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
   - **venv + pinned requirements.** Pros: standard, needs no extra tools. Cons: no lockfile for transitive dependencies (fine with so few dependencies).
   - **pyproject + uv.** Pros: fast and reproducible. Cons: reviewers need uv installed.
   - **Docker.** Pros: reproducible. Cons: **Docker on macOS can't use the Metal GPU**, so Ollama in a container would run on CPU only and be far too slow.
-- **Decision:** venv + pinned `requirements.txt`. Setup steps: install Ollama → `ollama pull qwen2.5:7b-instruct nomic-embed-text` → venv + `pip install` → a one-time tokenizer download → `ingest` → `chat`.
+- **Decision:** venv + pinned `requirements.txt`. Setup steps: install Ollama → `ollama pull qwen2.5:7b-instruct nomic-embed-text` → venv + `pip install` → a one-time tokenizer download (a pinned `tokenizer.json` saved to the gitignored `models/` folder, see D-010) → `ingest` → `chat`.
 
 ### D-022: Demo corpus: public Markdown docs + fictional `.txt` notes
 - **Status:** accepted (revised: originally public docs only)
@@ -358,3 +372,15 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
 - **Open details:** which public docs to use (check the licence and attribute it in the README), and the content of the fictional files and the eval questions.
 - **Likely reviewer questions:**
   - *"How do I know the model isn't just answering from pretraining?"* Ask about the fictional company. Those facts exist only in our `.txt` files.
+
+### D-023: Loader policy for unreadable and empty files
+- **Status:** accepted (2026-11-21, M1)
+- **Context:** `loaders.py` finds `.md`/`.txt` files under a directory and returns `Document(path, text)`. It does **no retrieval** (that happens in `retriever.py`, against the index). A real `data/` folder can contain a Latin-1 file, a file with a BOM, or an empty placeholder.
+- **Options considered:**
+  - **Skip and warn.** Read as `utf-8-sig` (which strips a BOM). On `UnicodeDecodeError`, or text that is empty or only whitespace, skip the file, print a warning naming it, and continue. Pros: one bad file never blocks ingest, and nothing garbled reaches the index. Cons: a skipped file's content is missing until it's fixed (the warning makes that visible).
+  - **`errors="replace"`.** Pros: never fails. Cons: bad bytes become `U+FFFD`, and the garbled text gets embedded, retrieved and shown to the LLM, all silently.
+  - **Fail the whole ingest.** Pros: strictest. Cons: one stray file stops everything, which is risky in a live demo.
+- **Decision:** Skip and warn.
+- **Why:** It matches the project's rule that **no failure is silent** (as with Ollama truncation in D-010 and D-011), without letting one file stop the whole run.
+- **Likely reviewer questions:**
+  - *"Why not guess the encoding?"* Guessing (e.g. with `chardet`) can be confidently wrong and adds a dependency. A clear warning lets the user convert the file once.

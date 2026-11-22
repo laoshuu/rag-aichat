@@ -14,11 +14,11 @@ M0 verify Ollama ─► M1 text → chunks ─► M2 chunks → index/ ─► M3
 
 | When | Milestone |
 |---|---|
-| Thu Nov 20 | **M0** (Claude runs the experiments; Ryan learns the Ollama API from the code) · start **M1** |
-| Fri Nov 21 | Finish **M1** · **M2** |
-| Sat Nov 22 | **M3** (end-to-end chat) · start **M4** |
-| Sun Nov 23 AM | Finish **M4** essentials · freeze 10:00 · share by 13:00 |
-| Sun Nov 23 PM – Mon AM | Review prep: demo rehearsal, re-read decisions.md, practise reviewer questions |
+| Thu Nov 19 | **M0** (Claude runs the experiments; Ryan learns the Ollama API from the code) · start **M1** |
+| Fri Nov 20 | Finish **M1** · **M2** |
+| Sat Nov 21 | **M3** (end-to-end chat) · start **M4** |
+| Sun Nov 22 AM | Finish **M4** essentials · freeze 10:00 · share by 13:00 |
+| Sun Nov 22 PM – Mon AM | Review prep: demo rehearsal, re-read decisions.md, practise reviewer questions |
 
 **Cut-line if time runs short:** M0–M3 plus a minimal corpus and README is a complete submission. A small eval (even 8–10 questions) is what makes the tuning numbers defensible, so keep at least that much of M4.
 

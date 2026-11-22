@@ -32,7 +32,7 @@ Ryan is the author. Claude is a senior AI-systems engineer pairing with him.
 
 ## Decision status
 
-All design decisions are recorded in [`docs/decisions.md`](docs/decisions.md) as D-001 to D-022, all `accepted`.
+All design decisions are recorded in [`docs/decisions.md`](docs/decisions.md) as D-001 to D-023, all `accepted`.
 
 **Current phase: building.** Discuss each decision in the context of the component being built, not in the abstract. Decisions stay flexible: when implementation shows a better option, raise it, discuss it, then update the entry. Keep the `[verify]` facts on the list and confirm each one when its component is built.
 

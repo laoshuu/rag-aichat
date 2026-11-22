@@ -9,6 +9,8 @@ Q&A collected during pairing sessions. Each entry answers one question, with con
 3. [If we already have embeddings, why do we need a tokenizer?](#3-if-we-already-have-embeddings-why-do-we-need-a-tokenizer)
 4. [Why does `exp_template_overhead` need `nonce()`?](#4-why-does-exp_template_overhead-need-nonce)
 5. [When does Ollama's prompt cache clear or refresh?](#5-when-does-ollamas-prompt-cache-clear-or-refresh)
+6. [How does our token count map to the 6,144 window? (budget, `5*messages + 3`)](#6-how-does-our-token-count-map-to-the-6144-window)
+7. [How are messages wrapped in the ChatML template? (worked example)](#7-how-are-messages-wrapped-in-the-chatml-template)
 
 ---
 
@@ -359,3 +361,163 @@ The catch: the retrieved chunks change every turn, so the cache helps only up to
 ### Likely reviewer question
 
 - *"How does caching affect your prompt design?"* Put stable content first (system prompt, then history), volatile content last (retrieved chunks, question). Measured: a one-word change at 25% depth reuses only 26% of the prompt, so the position of the first change decides the savings.
+
+---
+
+## 6. How does our token count map to the 6,144 window?
+
+**Where it shows up:** token budget table in [decisions.md](decisions.md) (D-011), D-010 (template overhead), [experiments/README.md](../experiments/README.md) §3-4.
+
+### Step 1: what 6,144 actually limits
+
+`num_ctx = 6144` is a limit on **prompt tokens + generated tokens together**. They live in the same window:
+
+```
+prompt_tokens + generated_tokens  <=  6,144
+```
+
+We can't know how long the answer will be, so we cap it with `num_predict = 1024` and reserve that room up front:
+
+```
+prompt_tokens  <=  6,144 - 1,024  =  5,120
+```
+
+That is where "5,120 for the prompt" comes from. The 1,024 is a ceiling on the answer, not a prediction. (Measured: a 6,022-token prompt with `num_predict=300` still generated 300 tokens, because Ollama silently evicted the start of the prompt mid-answer to make room. The reserve is what prevents that.)
+
+### Step 2: what `prompt_tokens` is, exactly
+
+Ollama doesn't feed raw text to the model. It wraps every message in Qwen's chat template (ChatML):
+
+```
+<|im_start|>system\nYou answer from context only.<|im_end|>\n
+<|im_start|>user\nHow do I turn on sync?<|im_end|>\n
+<|im_start|>assistant\n                      <- header for the answer to come
+```
+
+The special tokens and newlines around each message add **5 tokens per message** (`<|im_start|>`, `role`, `\n`, `<|im_end|>`, `\n`), and the trailing `<|im_start|>assistant\n` adds **3**. Measured to match Ollama exactly:
+
+```
+prompt_tokens = sum(count(content of each message)) + 5 * n_messages + 3
+```
+
+Why this matters: our tokenizer counts only the *text* we give it. If we budget with `sum(count(content))` alone, we under-count by 5 per message, and the gap grows with the number of messages. The formula closes the gap, so our count equals what Ollama will see.
+
+### Step 3: worked example (content counts are illustrative)
+
+A turn with 2 earlier exchanges in the history: messages = system + 4 history + 1 final user message (retrieved chunks + question) = **6 messages**.
+
+```
+system content                     280
+history content (4 messages)       400
+final user: chunks 2,100 + question 18   2,118
+---------------------------------------------
+sum of content                   2,798
+template overhead: 5 * 6 + 3        33
+---------------------------------------------
+prompt_tokens                    2,831     <= 5,120  OK  (2,289 spare)
+```
+
+Overhead grows with conversation length: with 10 history messages it would be 5 * 12 + 3 = **63**. Small, but not zero, and it only stays correct if we count it.
+
+### Step 4: how the budget table's numbers connect
+
+```
+6,144  window
+- 1,024  answer reserve (num_predict)
+-   300  system prompt
+- 1,024  history (cap)
+-    50  safety margin
+= 3,746  retrieved-context ceiling
+```
+
+(You wrote 3,726 earlier. The doc says **3,746**.) Each line is a **ceiling**, not a target (D-011). The table answers: "if every slot were full, what is the most the chunks could take?" The relevance filter (D-015) usually sends far less.
+
+### Where `5 * n + 3` lives in that table (honest gap)
+
+The table doesn't say which slot pays the template overhead. D-009 says history counts its own overhead inside its 1,024. For the rest, here is the full-slots arithmetic:
+
+```
+system:   300 content + 5            = 305
+history:  1,024 (overhead included)  = 1,024
+final user message: +5, trailing +3  =   8
+question tokens (not a row in the table) ~  20
+chunks:   3,746
+answer:   1,024
+-----------------------------------------------
+                                       6,127   vs 6,144 -> only 17 left of the 50 margin
+```
+
+So when every slot is full, the margin is already being eaten by the overhead and the question, which aren't listed in the table. The system is still safe, but only because of the margin. The more robust way to do it:
+
+**Compute the context budget at runtime instead of trusting a fixed 3,746.**
+
+```
+fixed  = count(system) + count(history incl. overhead) + count(question)
+         + count(instructions/wrappers around chunks) + 5 * n_messages + 3
+context_budget = min(3,746,  6,144 - num_predict - margin - fixed)
+```
+
+Then the builder adds chunks best-first until `context_budget` is used, counting each chunk's text **and** its formatting (e.g. a `[source: file.md]` header). The 3,746 stays as a cap, but the true limit is "whatever is left after the exact count of everything else". This is the safer design for the review, and a unit test can assert `prompt_tokens + 1,024 <= 6,144` for adversarial inputs (full history, long question, many chunks).
+
+*This is a proposed refinement to D-011, not yet agreed. Raise it before the prompt builder is written.*
+
+### Failure modes if this is wrong
+
+- **Undercount (forgot overhead or the question):** prompt creeps over 5,120. `prompt + answer` then exceeds 6,144 and Ollama silently evicts the **start** of the prompt during generation, losing the system prompt, with no error.
+- **Prompt itself over 6,144:** Ollama keeps only the last ~3,072 tokens (measured), so most context vanishes.
+- **Overcount:** only wasted capacity, a safe failure.
+- **Detection:** compare `prompt_eval_count` with our expected number after each response. They matched exactly in the measurements.
+
+### Likely reviewer questions
+
+- *"How do you guarantee the model never exceeds 6K?"* `num_ctx=6144` on every request, an exact count `sum(content) + 5n + 3` for the prompt, `num_predict=1024` reserved, and the prompt builder stops adding chunks when `prompt + 1,024` would exceed 6,144. A test asserts it.
+- *"Where does `5n + 3` come from?"* Measured against `prompt_eval_count`: Qwen's ChatML template adds 5 tokens per message and 3 for the assistant header.
+- *"Why is the answer reserve a fixed 1,024?"* Generated tokens share the window; we can't know the length in advance, so we cap it and reserve the cap.
+
+---
+
+## 7. How are messages wrapped in the ChatML template?
+
+**Where it shows up:** D-010 ("ChatML template"), entry 6 above. Numbers below were produced with the project's Qwen2.5 tokenizer file (`models/qwen2.5-tokenizer.json`), not estimated.
+
+### The wrapper
+
+Each message becomes `<|im_start|>` + role + `\n` + content + `<|im_end|>` + `\n`. After the last message, Ollama appends an open `<|im_start|>assistant\n`, and the model continues from there.
+
+### Example
+
+Messages: system "You answer from context only.", user "Hello, this is Ryan", assistant "This model has 128k parameters.", user "What is my name?".
+
+```
+<|im_start|>system\nYou answer from context only.<|im_end|>\n
+<|im_start|>user\nHello, this is Ryan<|im_end|>\n
+<|im_start|>assistant\nThis model has 128k parameters.<|im_end|>\n
+<|im_start|>user\nWhat is my name?<|im_end|>\n
+<|im_start|>assistant\n
+```
+
+Tokens of one message (`Ġ` = leading space, `Ċ` = newline):
+
+```
+<|im_start|> user Ċ | Hello , Ġthis Ġis ĠRyan | <|im_end|> Ċ
+   3 wrapper tokens        5 content tokens       2 wrapper tokens
+```
+
+`<|im_start|>` and `<|im_end|>` are single special tokens. The assistant message has 10 content tokens, because `128k` is split digit by digit: `Ġ`, `1`, `2`, `8`, `k`.
+
+| Message | Content | With wrapper |
+|---|---|---|
+| system | 6 | 11 |
+| user | 5 | 10 |
+| assistant | 10 | 15 |
+| user | 5 | 10 |
+| trailer `<|im_start|>assistant\n` | | 3 |
+| **Total** | **26** | **49** |
+
+`26 + 5 x 4 messages + 3 = 49`, equal to the token count of the whole string. Counting content only would give 26, 23 short.
+
+### Why this matters
+
+- The 5 per message and 3 for the trailer are exactly the formula in entry 6.
+- Without a system message, Qwen's template inserts its own default system prompt (+21 tokens measured), which is why we always send our own.
+- The special tokens are real tokens in the model's vocabulary. User text containing the literal string `<|im_end|>` could in principle confuse the template; worth a thought if the app ever accepts untrusted text, though our documents are local.
