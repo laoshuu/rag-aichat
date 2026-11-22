@@ -7,6 +7,7 @@ Two public functions, used by two different callers:
 
 from tokenizers import Tokenizer
 from rag_chat import config
+import math
 
 # Ollama wraps each message in Qwen's ChatML template
 OVERHEAD_PER_MSG = 5  # per message
@@ -35,4 +36,8 @@ def count_messages(messages: list[dict]) -> int:
     """
     content = sum(count(m["content"]) for m in messages)
     return content + len(messages) * OVERHEAD_PER_MSG + TRAILER
-
+  
+def split_by_tokens(text: str, max_tokens: int) -> list[str]:
+    enc = _tokenizer.encode(text, add_special_tokens=False)
+    cuts = [0] + [enc.offsets[i][0] for i in range(max_tokens, len(enc.ids), max_tokens)] + [len(text)]
+    return [text[a:b] for a, b in zip(cuts, cuts[1:]) if text[a:b]]   # skip empty slices

@@ -74,7 +74,7 @@ The hardest logic in the project, so it comes first.
 
 | File | Job |
 |---|---|
-| `data/` | A permissively licensed public Markdown doc set + 3 fictional `.txt` notes |
+| `data/` | A permissively licensed public Markdown doc set + 3 fictional `.txt` notes. **Check:** count code blocks and tables over the chunk budget; if any, add line-level splitting (D-014 known limit) |
 | `eval/questions.jsonl`, `eval/run_eval.py` | ~15 questions (single, follow-up, topic switch, unanswerable) → hit-rate@k; tune `w`, floor, δ, chunk size |
 | `README.md` | Clone → install Ollama → pull models → venv → ingest → chat; architecture summary |
 | `docs/decisions.md` | Replace guesses with measured numbers |

@@ -1,0 +1,13 @@
+Lumen team notes, planning meeting, March 3.
+
+Attendees: Priya (product), Marco (engineering), Dana (support), Kenji (design).
+
+Launch date for Lumen 4.0 moved from April 28 to May 12. The reason is the new sync engine: it passed functional testing, but battery use on laptops is still 20 percent higher than in version 3.2. Marco expects the fix to take two weeks.
+
+Lumen Pro will keep its price of $4 per month for existing subscribers. New subscribers after the 4.0 launch will pay $5 per month. Annual plans stay at $40 for everyone until the end of the year.
+
+Dana reported that the most common support ticket in February was about sync conflicts, 31 percent of all tickets. Most of them came from users who keep their notes folder inside a cloud drive. Support will add a warning to the setup screen when the chosen folder is inside a known cloud drive.
+
+Kenji showed the new dark theme. It will ship in 4.0 as the default on systems that are set to dark mode. The old high-contrast theme will be removed because fewer than 1 percent of users have it enabled.
+
+Action items: Marco fixes battery use by March 17. Dana drafts the cloud drive warning text by March 10. Priya announces the new date to beta testers this week.

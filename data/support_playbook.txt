@@ -1,0 +1,11 @@
+Lumen support playbook. Internal, for support staff only.
+
+Refunds. Pro subscriptions can be refunded in full within 14 days of purchase, no questions asked. After 14 days, offer a refund only for the unused months of an annual plan. Monthly plans are never refunded after 14 days.
+
+Escalation. Any ticket that mentions lost notes goes to engineering within 1 hour, even if the user later finds the notes. Use the tag DATA-LOSS so engineering's on-call engineer is paged. All other tickets are answered within 1 business day.
+
+Sync conflicts. First ask whether the notes folder is inside a cloud drive such as a synced Documents folder. If it is, ask the user to move it out and re-select it under Settings > Storage. This fixes most repeated conflicts.
+
+Account deletion. Deleting an account removes synced notes from Lumen servers after 30 days. Local note files on the user's devices are never deleted, because they are ordinary files that belong to the user.
+
+Tone. Never blame the user. Say "the sync got confused" rather than "you edited it in two places".

@@ -95,3 +95,33 @@ def test_count_matches_ollama_prompt_eval_count():
         pytest.skip(f"Ollama or {config.CHAT_MODEL} not available")
     # prompt_eval_count reports the full prompt even when cached (D-010, M0).
     assert count_messages(msgs) == resp["prompt_eval_count"]
+
+
+# --- split_by_tokens() -------------------------------------------------------
+
+from rag_chat.tokens import split_by_tokens  # noqa: E402
+
+
+def test_split_by_tokens_is_lossless_and_within_limit():
+    text = "| E1001 | Sync failed | Restart sync |\n" * 20
+    parts = split_by_tokens(text, 30)
+    assert "".join(parts) == text
+    assert len(parts) > 1
+    assert all(count(p) <= 31 for p in parts)   # +1: re-tokenizing a slice can shift by one
+
+
+def test_split_by_tokens_never_breaks_a_multi_token_character():
+    # 🦩 is 3 tokens; cutting by start offsets keeps it whole in exactly one piece.
+    text = "Sync 🦩 done " * 10
+    for n in range(1, 8):
+        parts = split_by_tokens(text, n)
+        assert "".join(parts) == text
+        assert all("�" not in p for p in parts)
+
+
+def test_split_by_tokens_short_text_is_one_piece():
+    assert split_by_tokens("hello world", 100) == ["hello world"]
+
+
+def test_split_by_tokens_empty_text():
+    assert split_by_tokens("", 10) == []

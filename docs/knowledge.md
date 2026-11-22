@@ -11,6 +11,9 @@ Q&A collected during pairing sessions. Each entry answers one question, with con
 5. [When does Ollama's prompt cache clear or refresh?](#5-when-does-ollamas-prompt-cache-clear-or-refresh)
 6. [How does our token count map to the 6,144 window? (budget, `5*messages + 3`)](#6-how-does-our-token-count-map-to-the-6144-window)
 7. [How are messages wrapped in the ChatML template? (worked example)](#7-how-are-messages-wrapped-in-the-chatml-template)
+8. [How does overlap work in the chunker, and why do we sometimes need it?](#8-how-does-overlap-work-in-the-chunker-and-why-do-we-sometimes-need-it)
+9. [Exactly when is overlap triggered? (piece-by-piece trace)](#9-exactly-when-is-overlap-triggered)
+10. [Why is the chunk size 400 tokens?](#10-why-is-the-chunk-size-400-tokens)
 
 ---
 
@@ -521,3 +524,237 @@ Tokens of one message (`Ġ` = leading space, `Ċ` = newline):
 - The 5 per message and 3 for the trailer are exactly the formula in entry 6.
 - Without a system message, Qwen's template inserts its own default system prompt (+21 tokens measured), which is why we always send our own.
 - The special tokens are real tokens in the model's vocabulary. User text containing the literal string `<|im_end|>` could in principle confuse the template; worth a thought if the app ever accepts untrusted text, though our documents are local.
+
+---
+
+## 8. How does overlap work in the chunker, and why do we sometimes need it?
+
+**Where it shows up:** [rag_chat/chunker.py](../rag_chat/chunker.py) (`_overlap`, `_pack`), `OVERLAP = 50` in [rag_chat/config.py](../rag_chat/config.py), D-014. All chunks and scores below are **real output** from the project's chunker and `nomic-embed-text`, run with a small `CHUNK_SIZE` (70) and `OVERLAP` (30) so a short paragraph splits. Production values are 400 and 50.
+
+### What overlap is
+
+When one section is too long for a single chunk, the chunker cuts it into several. **Overlap** means the next chunk **starts with the last whole sentence(s) of the previous chunk**, so the text near each cut appears in both chunks.
+
+### The mechanism, step by step (`_pack`)
+
+Input: the sentences of one section (each one a `Piece`). Budget = `CHUNK_SIZE` minus the heading prefix, here 70 - 6 = **64 body tokens**.
+
+```
+sentence                                                         tokens  running total
+0 Lumen can sync notes across your devices.                        10        10
+1 Sync is off by default.                                           7        17
+2 To turn it on, open Settings > Sync and sign in ... account.     19        36 (counts aren't exactly additive; code recounts)
+3 Free accounts can sync up to 3 devices.                          11        ~47
+4 Adding a fourth device signs out the oldest one automatically.   12        55
+5 This limit does not apply to Pro accounts, which ... 10 devices. 19        55 + 19 = 74 > 64   <- doesn't fit
+```
+
+1. `_pack` appends pieces one by one, **recounting the whole candidate** each time. Sentences 0-4 fit (55 tokens). Adding sentence 5 would make 74 > 64, so chunk 0 is **closed**.
+2. **Seed the next chunk.** `_overlap(text, OVERLAP=30)` walks the closed chunk's sentences **backwards**, adding whole sentences while the total stays <= 30 tokens:
+   - sentence 4 (12 tokens) fits, tail = 12
+   - sentence 3 (11 tokens) fits, tail = 23
+   - sentence 2 (19 tokens) would make 42 > 30, **stop**
+   - overlap = sentences 3 + 4 = **22 tokens**
+3. The new chunk starts as that overlap, then sentence 5 is added: 22 + 19 = 41 body tokens (+ 6 prefix = 47 total, matching the output below).
+4. If `overlap + the new piece` doesn't fit the budget, the overlap is dropped and the chunk starts clean with just the piece.
+
+Rules that make it safe:
+
+| Rule | Code | Why |
+|---|---|---|
+| Whole sentences only | `_split_sentences` | Chunks start at a sentence boundary, not mid-word. |
+| Never the first sentence | `[1:]` in `_overlap` | The overlap can never be the entire previous chunk (that would make chunks identical and the loop pointless). |
+| No overlap if even the last sentence is over the limit | `return ""` | A 60-token sentence would blow the 50-token allowance. |
+| No overlap after code | `last_was_code` | Repeating half a code block is noise. |
+| Never across headings | `_pack` runs once per section | A new heading is a clean topic boundary, and its heading-path prefix already gives context. |
+
+### Why we sometimes need it: a worked example
+
+The document (one section, `Lumen Notes Guide > Sync`):
+
+> Lumen can sync notes across your devices. Sync is off by default. To turn it on, open Settings > Sync and sign in with your Lumen account. **Free accounts can sync up to 3 devices. Adding a fourth device signs out the oldest one automatically.** **This limit does not apply to Pro accounts, which can sync up to 10 devices.**
+
+The fact the user will ask about is split across the cut: the **limit** is stated in sentences 3-4, and the **exception** ("this limit does not apply to Pro") in sentence 5.
+
+Question: *"Does the 3-device limit apply to Pro accounts?"*
+
+**Without overlap (`OVERLAP = 0`)**
+
+```
+chunk 0 (61 tok)  cos = 0.589
+  Lumen Notes Guide > Sync
+  Lumen can sync notes ... Free accounts can sync up to 3 devices. Adding a fourth device signs out the oldest one automatically.
+
+chunk 1 (26 tok)  cos = 0.763
+  Lumen Notes Guide > Sync
+  This limit does not apply to Pro accounts, which can sync up to 10 devices.
+```
+
+Chunk 1 is the best match, so it gets retrieved. But read it alone: **"This limit"** refers to something that is in the other chunk. The model sees an exception to a rule it was never shown. If chunk 0 is not also in the prompt (the relevance filter drops it, the context budget runs out, or the top-k cuts it), the model has to guess what the limit is, or answers vaguely.
+
+**With overlap (`OVERLAP = 30`)**
+
+```
+chunk 1 (47 tok)  cos = 0.743
+  Lumen Notes Guide > Sync
+  Free accounts can sync up to 3 devices. Adding a fourth device signs out the oldest one automatically. This limit does not apply to Pro accounts, which can sync up to 10 devices.
+```
+
+Now the chunk is self-contained: it states the limit, the consequence and the exception. The top-1 chunk alone is enough to answer correctly: "No, Pro accounts can sync up to 10."
+
+### The honest part: what overlap costs and does not do
+
+- **The score did not go up.** 0.763 without overlap, 0.743 with it. Overlap is not a retrieval-accuracy trick here, since chunk 1 already won. Its value is **what the LLM sees after retrieval**: a complete statement.
+- **It costs tokens.** Chunk 1 grew from 26 to 47 tokens. If both chunks are retrieved, the sentence "Free accounts can sync up to 3 devices..." is in the prompt **twice**, wasting about 22 tokens of a 3,746 ceiling.
+- **It costs index size and embedding time** (small at our corpus size).
+- **It's a mitigation, not a guarantee.** If the dependency reaches back further than ~50 tokens (e.g. "as described above" referring to a paragraph ten sentences earlier), overlap won't help.
+
+### When overlap matters and when it doesn't
+
+| Situation | Overlap helps? |
+|---|---|
+| Fact + condition/exception split across a cut ("...limit." / "This limit does not apply...") | **Yes**: the example above |
+| Pronouns and references at the start of a chunk ("It", "this", "the above", "however") | **Yes** |
+| A definition in one sentence and its use in the next | **Yes** |
+| Cut falls at a heading | No: no overlap by design. The heading-path prefix gives the context. |
+| Cut falls between independent paragraphs (each is self-contained) | Little: duplicates tokens for no benefit |
+| Code blocks or tables | No: atomic, or split by tokens as a last resort |
+
+That is why the decision says overlap applies "only when a section is cut into several chunks", and why `CHUNK_SIZE = 400` matters: most sections of short docs fit in one chunk and never need overlap at all.
+
+### Why whole sentences instead of "the last 50 tokens"
+
+A fixed 50-token tail would start chunks in the middle of a sentence ("...ts can sync up to 3 devices. Adding a..."), which reads badly to the LLM and embeds worse. Whole sentences cost a little precision on the overlap size (22 tokens used instead of up to 30) and buy readable chunks. This was an explicit rejected option in D-014.
+
+### Likely reviewer questions
+
+- *"Why overlap?"* So a fact that straddles a cut appears whole in at least one chunk. Example: "This limit does not apply to Pro" is meaningless without the sentence that states the limit.
+- *"What does it cost?"* Duplicated tokens in the index and, when neighbours are both retrieved, in the prompt. Capped at 50 tokens per cut (about 12% of a chunk).
+- *"Did you measure that it helps?"* Not yet in the eval set. The retrieval score didn't change in the example; the benefit is in answer quality. Worth adding a straddling-fact question to `eval/questions.jsonl` (D-019) so overlap on/off can be compared.
+- *"Why no overlap across headings?"* A heading is a natural topic boundary, and the heading-path prefix is already prepended to every chunk.
+
+---
+
+## 9. Exactly when is overlap triggered?
+
+**Where it shows up:** `_pack` in [rag_chat/chunker.py](../rag_chat/chunker.py#L179). Follow-up to entry 8. Token counts are real (Qwen tokenizer); budgets are toy values so a short example cuts. Sizes are body tokens, without the heading prefix.
+
+### The trigger
+
+```python
+if text and count(candidate) > budget:   # the next piece doesn't fit in the chunk being built
+```
+
+Overlap runs only when **the next piece would overflow a non-empty chunk**. A long section does not trigger it by itself.
+
+### Pieces used
+
+```
+piece 1: "The export tool writes a CSV file. "                      9 tok
+piece 2: "Free accounts can export up to 3 notebooks. "           11 tok
+piece 3: "Pro accounts can export up to 10 notebooks. "            12 tok
+piece 4: "Exports older than 30 days are deleted automatically."    11 tok
+```
+
+### Case A: not triggered (budget 80)
+
+```
+p1: chunk empty -> start (9)
+p2: candidate 19 <= 80 fits
+p3: candidate 30 <= 80 fits
+p4: candidate 41 <= 80 fits
+=> one chunk, 41 tokens. _overlap never runs.
+```
+
+### Case B: triggered (budget 36, OVERLAP 20)
+
+```
+p1: start (9)
+p2: candidate 19 <= 36 fits
+p3: candidate 30 <= 36 fits
+p4: candidate 41 > 36  -> close chunk 0 (30 tok)
+```
+
+`_overlap(chunk 0, 20)` walks sentences backwards: piece 3 (12) fits -> 12; piece 2 (11) would make 23 > 20 -> stop.
+
+```
+chunk 0: The export tool ... CSV file. Free accounts ... 3 notebooks. Pro accounts ... 10 notebooks.
+chunk 1: Pro accounts can export up to 10 notebooks. Exports older than 30 days are deleted automatically.
+         [overlap: 12 tok]                           [piece 4: 11 tok]   = 23
+```
+
+### Case C: triggered, but no overlap (OVERLAP 8)
+
+Same cut. Piece 3 is 12 tokens > 8, so `_overlap` returns `""`. Chunk 1 is piece 4 alone (11 tok).
+
+### Case D: triggered, overlap computed, then dropped (budget 36, OVERLAP 20)
+
+```
+piece 1: "Aaa bbb ... kkk. "                                  23 tok
+piece 2: "Free accounts can export up to 3 notebooks. "        11 tok
+piece 3: "Pro accounts ... 10 notebooks, and each notebook
+          can hold up to 5,000 notes with attachments."      28 tok
+
+p3: candidate 60 > 36 -> close chunk 0 (33 tok)
+    overlap = piece 2 (11 tok)
+    overlap + piece 3 = 38 > 36 -> overlap DROPPED; chunk 1 = piece 3 alone
+```
+
+The new piece has priority over the overlap.
+
+### Decision table
+
+| Situation | Overlap? |
+|---|---|
+| Everything fits in one chunk (A) | none needed |
+| Next piece overflows, last sentence(s) fit in `OVERLAP` (B) | yes |
+| Next piece overflows, but the last sentence is over `OVERLAP` (C) | no |
+| Overlap + new piece would exceed the budget (D) | dropped |
+| The piece before the cut was code (`last_was_code`) | no (from reading the code, not traced here) |
+| Chunk contains a single sentence (`[1:]` skips the first) | no (from reading the code, not traced here) |
+| Next section / new heading (`_pack` is called per section) | never carried across |
+
+---
+
+## 10. Why is the chunk size 400 tokens?
+
+**Where it shows up:** `CHUNK_SIZE = 400` in [rag_chat/config.py](../rag_chat/config.py), D-014, D-019.
+
+### Honest status first
+
+400 is a **reasoned starting point, not a measured optimum.** D-014 says so ("we'll test 200 vs 400 vs 600 with the retrieval eval (D-019)"), and `eval/` doesn't exist yet. The reasons below justify the *range*; the eval should pick the final number.
+
+### Chunk size is a trade-off between two failure modes
+
+| | Too small (~100-200) | Too large (~800+) |
+|---|---|---|
+| Meaning | Sharp, single-topic vectors | **Pooling dilutes meaning**: the embedder averages all token vectors into one, so a chunk on install + sync + pricing matches none of them strongly (toy example in D-014: 0.62 vs 0.97 for a focused chunk) |
+| Context for the LLM | A fact is cut away from its explanation, conditions and exceptions | Plenty of context |
+| Prompt budget | Many tiny chunks; the 8-chunk cap leaves budget unused | Few chunks, so only 3-4 chances for retrieval to hit |
+| Cost | More vectors, higher fixed overhead per chunk | Slow prefill, and noise tokens (irrelevant sentences) |
+
+### The numbers that fix the range
+
+All from this project's measurements and budget:
+
+1. **The retrieval ceiling is 3,746 tokens** (D-011), and chunk selection stops at **8 chunks** (D-015).
+   - 400 tokens: 8 chunks = ~3,200 tokens, so the ceiling and the 8-chunk cap are about equal (3,746 / 400 = 9.4). Both limits are used.
+   - 200 tokens: 8 chunks = 1,600 tokens, so over half the budget is never usable unless the cap is raised.
+   - 600 tokens: 3,746 / 600 = 6 chunks. Fewer independent chances to hit the right section.
+2. **Prefill speed is ~280 tokens/s** (measured). Eight 400-token chunks is ~3,200 tokens, about **11-12 s** before the first token (3,200 / 280). 600-token chunks at the same 8-chunk cap would be ~4,800 tokens, about 17 s, and wouldn't fit under 3,746 anyway.
+3. **nomic's input limit is 2,048 tokens** (measured, silently truncated), so 400 is far inside it. The limit isn't the constraint, so it doesn't force the choice. (mxbai-embed-large has a 512-token limit, which would have, a reason it was rejected.)
+4. **Fixed costs shrink with size:** the heading prefix is ~6 tokens (1.5% of 400, 3% of 200), and overlap of 50 is 12.5% of 400 but 25% of 200.
+5. **Typical docs are short sections.** Many Markdown sections are well under 400 tokens, so they become one chunk (no overlap). The size matters mostly for long sections, which get cut.
+
+### Why measured in Qwen tokens, not nomic's
+
+The chunk must fit the **LLM's** prompt budget, so it's counted with the Qwen tokenizer (entry 3). nomic only needs the chunk to fit its own, larger window.
+
+### How to defend the number
+
+*"Why 400?"* It is big enough to hold a complete explanation (about 300 words; a paragraph or two with its condition and exception), small enough that 6-8 fit in the context budget (about 11 s prefill), and small enough that a chunk usually covers one topic so its vector stays sharp. It is a starting value; the eval compares 200, 400 and 600 by hit-rate@k and I'd change it if the numbers disagree.
+
+### To do
+
+- Build `eval/questions.jsonl` and run 200 / 400 / 600 (D-019), then replace this entry's "reasoned" status with numbers.
+- Include questions whose answer spans two sentences, so the size and overlap effects are visible (see entry 8).
