@@ -14,6 +14,7 @@ Q&A collected during pairing sessions. Each entry answers one question, with con
 8. [How does overlap work in the chunker, and why do we sometimes need it?](#8-how-does-overlap-work-in-the-chunker-and-why-do-we-sometimes-need-it)
 9. [Exactly when is overlap triggered? (piece-by-piece trace)](#9-exactly-when-is-overlap-triggered)
 10. [Why is the chunk size 400 tokens?](#10-why-is-the-chunk-size-400-tokens)
+11. [What does it mean that the local LLM has a context length of 6,144?](#11-what-does-a-context-length-of-6144-mean)
 11. [Why does nomic need `search_document:` / `search_query:` prefixes?](#11-why-does-nomic-need-search_document--search_query-prefixes)
 
 ---
@@ -810,3 +811,71 @@ Because nobody would notice these by eye, `tests/test_embedder.py` checks that e
 
 - *"Why not put the prefix on `Chunk.full_text`?"* Because `full_text` also goes into the LLM prompt. The prefix is an instruction to the embedding model only, so it belongs in the one module that talks to it.
 - *"Does the prefix make retrieval more accurate?"* That's what the model was trained for, and the model card says to use it. On our data it isn't proven yet. The eval will compare with vs. without.
+
+---
+
+## 11. What does a context length of 6,144 mean?
+
+**Where it shows up:** `TOT_CONTEXT_LENGTH = 6144` in [rag_chat/config.py](../rag_chat/config.py), D-002 and D-011, sent to Ollama as `num_ctx`.
+
+### Definition
+
+The context window is the **maximum number of tokens the model can hold in view at once**: everything it reads (prompt) **plus** everything it writes (answer). The model has no memory outside this window.
+
+```
+prompt tokens + generated tokens  <=  6,144
+```
+
+"6K" in the problem statement is 6 x 1,024 = 6,144.
+
+### The model is stateless: every turn resends everything
+
+The LLM does not remember the previous turn. Each request must contain all the information it should use. A chat is an illusion built by the app resending the history each time. Illustrative token counts:
+
+```
+Turn 1 request:  system 300 | question 20 | chunks 2,000            = 2,320 in, answer 150 out
+Turn 2 request:  system 300 | turn 1 Q+A 170 | question 20 | NEW chunks 2,100 = 2,590 in, answer 200 out
+```
+
+Turn 1's chunks are **not** in turn 2 unless we put them there. Whatever isn't in the window doesn't exist for the model. That is why the app needs a token budget (entry 6): system prompt, history, retrieved chunks and the answer reserve all compete for the same 6,144 slots.
+
+### What the window physically is: the KV cache
+
+For each token in the window, the model keeps key/value vectors for every layer (the "KV cache"), so attention can look back at earlier tokens. `num_ctx = 6144` makes Ollama allocate room for 6,144 tokens of it.
+
+Rough size for Qwen2.5-7B (from its published config: 28 layers, 4 KV heads, head dim 128; this is a calculation, not something we measured here):
+
+```
+per token = 2 (K and V) x 28 layers x 4 heads x 128 dims x 2 bytes (fp16) = 57,344 bytes ~ 56 KB
+ 6,144 tokens ~ 0.34 GB
+32,768 tokens ~ 1.8 GB   (the model's native maximum)
+```
+
+So the window is a memory-and-speed choice: it sits on top of the ~4.6 GB of Q4_K_M weights (entry 1), and a longer window costs more memory and slower prefill (~280 tok/s measured, so a full 5K prompt takes ~18 s).
+
+### 6,144 is a choice, not the model's limit
+
+- **Qwen2.5-7B's native window is 32,768.** The 6K is a **hard constraint from the assignment**, so we enforce it ourselves.
+- The runtime layer: `num_ctx = 6144` on every request (D-002). Ollama's default is only **4,096** (measured), and sending a different value makes Ollama reload the model.
+- The application layer: our prompt builder counts tokens exactly and never assembles more than 6,144 - 1,024 (entry 6). A test asserts it.
+
+### What happens when the window is exceeded (all measured)
+
+| Situation | What Ollama does |
+|---|---|
+| Prompt alone is bigger than `num_ctx` | **Silently** keeps only the last ~num_ctx/2 tokens (3,074 of 7,074 sent), dropping the start, where the system prompt sits. HTTP 200, no error. |
+| Prompt fits but prompt + answer doesn't | Evicts the **start** of the prompt during generation ("context shift"), so the model forgets the instructions mid-answer. |
+| Default `num_ctx` (4,096) used by mistake | The same silent truncation at 4,096. |
+
+Both failures look like a normal answer, just wrong. This is why prevention (exact budgeting) matters more than detection.
+
+### Why bigger isn't automatically better
+
+- More memory (KV cache) and slower prefill (time to first token).
+- Models tend to use the middle of very long prompts less reliably, and irrelevant chunks add noise. Our filter (D-015) keeps typical prompts short even though the ceiling is 3,746 tokens.
+
+### Likely reviewer questions
+
+- *"What does 6K context mean?"* The model can attend to at most 6,144 tokens at once, counting both what we send and what it generates. It has no other memory, so every turn we resend the system prompt, the recent history and fresh retrieved chunks.
+- *"The model supports 32K. How do you guarantee 6K?"* `num_ctx = 6144` on every request, plus exact token counting in the prompt builder, plus an answer reserve, plus a test (D-002).
+- *"What happens if you go over?"* Ollama truncates silently, so we prevent it.

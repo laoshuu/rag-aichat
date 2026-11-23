@@ -1,12 +1,12 @@
-"""Command line: `python -m rag_chat ingest <dir>` | `search "<question>"` (D-005, D-012).
-Thin layer: parse args, call the pipeline modules in order, print, map errors to exit 1.
-No logic of its own; `chat` joins in M3."""
+"""Command line: `python -m rag_chat ingest <dir>` | `search "<question>"` | `chat` (D-005, D-012).
+Thin layer: parse args, call the pipeline modules in order, print, map errors to exit 1."""
 
 import argparse
 import sys
 import time
 from pathlib import Path
-from rag_chat import config, loader, chunker, embedder, store
+from rag_chat import config, loader, chunker, embedder, store, retriever, prompt, llm
+from rag_chat.chunker import Chunk
 
 # ---------------------------------------------------------------- ingest
 def cmd_ingest(args) -> int:
@@ -31,7 +31,50 @@ def cmd_search(args) -> int:
         print(" " + c.text[:100].replace("\n", " "))
     return 0
 
-def label(c: chunker.Chunk) -> str:                   # "lumen_guide.md › Lumen Notes Guide › Sync"
+# ---------------------------------------------------------------- chat
+def cmd_chat(args) -> int:
+    index   = store.load(config.INDEX_DIR)        # 3 checks happen here
+    history = []          # owned by cmd_chat, lives for the whole session: [(question, answer)]
+    print("Ask a question. /reset clears history, /quit exits.")
+    while True:
+        try:
+            current = input("\n> ").strip()
+        except (EOFError, KeyboardInterrupt):     # Ctrl-D / Ctrl-C at the prompt
+            print()
+            return 0
+        if not current:
+            continue
+        if current == "/quit":
+            return 0
+        if current == "/reset":
+            history = []                          # next question is a first turn again (no previous)
+            print("history cleared")
+            continue
+
+        previous = history[-1][0] if history else None   # last user question (D-013)
+        q        = retriever.query_vector(current, previous)
+        chunks   = retriever.select(index.search(q))     # relevance only (D-015)
+        try:
+            messages, included, expected = prompt.build(history, chunks, current)
+        except ValueError as e:                   # question alone exceeds the context slot
+            print(f"error: {e}", file=sys.stderr)
+            continue
+
+        pieces = []
+        for piece in llm.stream(messages, expected):     # D-020: print as tokens arrive
+            print(piece, end="", flush=True)
+            pieces.append(piece)
+        print()
+
+        print("\nSources:")                       # D-017: chunks that were in the prompt
+        for c, score in included:
+            print(f"  {label(c)} ({score:.2f})")
+        if not included:
+            print("  (none passed the relevance filter)")
+
+        history.append((current, "".join(pieces)))       # raw question, not the context-stuffed message
+
+def label(c: Chunk) -> str:                   # "lumen_guide.md › Lumen Notes Guide › Sync"
     if c.heading_path == [c.source]:                  # .txt: heading_path is just the filename
         return c.source                               # avoid "notes.txt › notes.txt"
     return " > ".join([c.source] + c.heading_path)
@@ -49,6 +92,9 @@ def main(argv=None) -> int:
     p.add_argument("question")
     p.add_argument("-k", type=int, default=5)
     p.set_defaults(func=cmd_search)
+
+    p = sub.add_parser("chat", help="start chatting with RAG chatbot")
+    p.set_defaults(func=cmd_chat)
 
     args = parser.parse_args(argv)
     try:

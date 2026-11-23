@@ -63,8 +63,8 @@ The hardest logic in the project, so it comes first.
 
 | File | Job |
 |---|---|
-| `rag_chat/retriever.py` | Weighted query vector (D-013); relevance floor + relative cutoff + budget (D-015) |
-| `rag_chat/prompt.py` | System + history window + context + question; **≤ 5,120 prompt tokens** |
+| `rag_chat/retriever.py` | Weighted query vector (D-013); relevance floor + relative cutoff + max 8 chunks, no token counting (D-015) |
+| `rag_chat/prompt.py` | System + history window + chunks fitted best-first into the remaining budget + question; returns messages, included chunks, expected count; **≤ 5,120 prompt tokens** (D-011) |
 | `rag_chat/llm.py` | Streaming `/api/chat`; `num_ctx`; `prompt_eval_count` check |
 | `rag_chat/cli.py` (`chat`) | REPL, streaming output, sources, `/quit`, `/reset`, model warm-up |
 | `tests/test_prompt.py` | **Key test:** whatever chunks or history are fed in, the prompt never exceeds the budget |

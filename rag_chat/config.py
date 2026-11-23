@@ -36,3 +36,9 @@ TOKENIZER_PATH = ROOT / "models" / "qwen2.5-tokenizer.json"
 
 # --- Embeddings ---------------------------------------------------
 EMBED_BATCH_SIZE = 64
+
+# --- Query ---------------------------------------------------
+QUERY_WEIGHT = 0.8
+SCORE_FLOOR = 0.5
+SCORE_DELTA = 0.2
+MAX_CHUNKS = 8
