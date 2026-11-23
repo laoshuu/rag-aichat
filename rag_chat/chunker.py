@@ -20,7 +20,7 @@ from dataclasses import dataclass, replace
 from typing import NamedTuple
 
 from rag_chat import config
-from rag_chat.loaders import Document
+from rag_chat.loader import Document
 from rag_chat.tokens import count, split_by_tokens
 
 

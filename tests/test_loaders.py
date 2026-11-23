@@ -1,7 +1,7 @@
-"""Tests for rag_chat.loaders (D-023: skip + warn, never silent, never fatal)."""
+"""Tests for rag_chat.loader (D-023: skip + warn, never silent, never fatal)."""
 import pytest
 
-from rag_chat.loaders import Document, load_documents
+from rag_chat.loader import Document, load_documents
 
 
 def write(root, rel, data):

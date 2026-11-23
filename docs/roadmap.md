@@ -41,7 +41,7 @@ The hardest logic in the project, so it comes first.
 | `requirements.txt`, `rag_chat/__init__.py` | Scaffolding | Claude |
 | `rag_chat/config.py` | All constants (`NUM_CTX`, budget caps, model names, chunk size) | Ryan |
 | `rag_chat/tokens.py` | `count(text)` with the Qwen tokenizer + per-message overhead | Ryan |
-| `rag_chat/loaders.py` | Find and read `.md`/`.txt`; handle bad encodings and empty files | Ryan |
+| `rag_chat/loader.py` | Find and read `.md`/`.txt`; handle bad encodings and empty files | Ryan |
 | `rag_chat/chunker.py` | Headings → paragraphs → sentences; ~400-token packing; overlap; heading path | Ryan (**the main piece**) |
 | `tests/test_chunker.py`, `tests/test_loaders.py` | Edge cases | Ryan (Claude suggests cases) |
 
@@ -51,12 +51,13 @@ The hardest logic in the project, so it comes first.
 
 | File | Job |
 |---|---|
-| `rag_chat/embedder.py` | Batched `/api/embed`; `search_document:` / `search_query:` prefixes; L2-normalization |
-| `rag_chat/store.py` | Save and load `vectors.npy` + `chunks.json` + `manifest.json`; `search(q)`; model-mismatch check |
-| `rag_chat/cli.py` (`ingest`) | `python -m rag_chat ingest data/` |
-| `tests/test_store.py` | Save → load round trip; known vector ranks first |
+| `rag_chat/embedder.py` | `embed_documents` / `embed_query`; batches of ~64 to `/api/embed` with progress; `search_document:` / `search_query:` prefixes; always L2-normalize; clear errors for Ollama down / model not pulled (D-007) |
+| `rag_chat/store.py` | `save` / `load` of `vectors.npy` + `chunks.json` + `manifest.json`; `Index.search(q)` → **all** chunks sorted best-first; refuse on model mismatch, warn on chunk-param mismatch, raise on count mismatch (D-008, D-012) |
+| `rag_chat/cli.py` (`ingest`, `search`) | `python -m rag_chat ingest data/` · `python -m rag_chat search "question"` prints top results as `file › heading (score)`, no LLM |
+| `tests/test_store.py` | Save → load round trip; known vector ranks first; model mismatch refused; count mismatch raises |
+| `tests/test_embedder.py` | `requests.post` monkeypatched: correct prefixes sent, output normalized (no Ollama needed) |
 
-**Done when** `ingest` writes `index/` and a query prints sensible ranked chunks, with **no LLM involved yet**. Check retrieval quality here.
+**Done when** `ingest` writes `index/` and `search "…"` prints sensible ranked chunks, with **no LLM involved yet**. Check retrieval quality here.
 
 ## M3: index → chat *(end-to-end)*
 

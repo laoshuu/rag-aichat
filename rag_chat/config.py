@@ -7,6 +7,7 @@ from pathlib import Path
 # `python -m rag_chat ...` works no matter where it is run from.
 ROOT = Path(__file__).resolve().parent.parent
 OLLAMA_BASE_URL = "http://localhost:11434"
+INDEX_DIR = ROOT / "index"
 
 # --- Context budget (D-011) --------------------------------------------------
 TOT_CONTEXT_LENGTH = 6144
@@ -31,3 +32,7 @@ TOKENIZER_REPO = "Qwen/Qwen2.5-7B-Instruct"
 TOKENIZER_REVISION = "a09a35458c702b33eeacc393d103063234e8bc28"  # HF commit
 TOKENIZER_SHA256 = "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539"
 TOKENIZER_PATH = ROOT / "models" / "qwen2.5-tokenizer.json"
+
+
+# --- Embeddings ---------------------------------------------------
+EMBED_BATCH_SIZE = 64

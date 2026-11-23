@@ -14,7 +14,7 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
 
 ```
                      INGEST (offline, `rag-chat ingest <dir>`)
- .md/.txt files ──► loaders ──► chunker ──► embedder ──────► index/ (vectors.npy + chunks.json)
+ .md/.txt files ──► loader ───► chunker ──► embedder ──────► index/ (vectors.npy + chunks.json)
                                 (heading-aware,  (Ollama:
                                  ~400 tok)        nomic-embed-text)
 
@@ -155,6 +155,13 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
 - **Decision:** `nomic-embed-text` through Ollama's embed API.
 - **Why:** One runtime for both models keeps the stack small, and its input limit comfortably covers 400-token chunks plus heading prefixes.
 - **Trade-offs accepted:** If we ever change the embedding model, the whole index must be rebuilt, because vectors from different models aren't comparable. We'll store the model name in the index metadata and refuse to load a mismatched index.
+- **Implementation (M2):**
+  - **We L2-normalize anyway**, even though Ollama's nomic vectors already come back with norm 1.0000 (measured in M0). It's one line. With it, "cosine = dot product" is guaranteed by our code, not by something we happened to observe about one model. Without it, switching `EMBED_MODEL` to a model that doesn't normalize would silently turn `M @ q` into a length-biased score.
+  - Texts go to `/api/embed` in **batches of ~64**, with a progress line, so a few-hundred-chunk ingest doesn't look hung and every request stays small.
+  - **Two first-run errors get a clear message and exit 1:**
+    - Connection refused: "run `ollama serve`".
+    - HTTP 404 `{"error":"model '…' not found"}` (verified): "run `ollama pull nomic-embed-text`".
+  - **Tested without Ollama:** `requests.post` is monkeypatched to check that both prefixes are sent and that the output is normalized. Those are the two silent-failure modes.
 - **Likely reviewer questions:**
   - *"Why different prefixes for queries and documents?"* nomic was trained with asymmetric task prefixes. A short question and a long passage get mapped into a shared space more accurately when the model knows which is which.
   - *"Why cosine similarity?"* It compares direction and ignores length. We L2-normalize vectors once at ingest, so cosine becomes a plain dot product.
@@ -169,8 +176,12 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
 - **Decision:** NumPy, exact cosine search over normalized vectors (`scores = M @ q`, then `argsort`).
 - **Why:** At hundreds to thousands of chunks, a matrix multiply takes well under a millisecond. Exact results also make the retrieval eval (D-019) deterministic.
 - **Trade-offs accepted:** Memory is N × 768 × 4 bytes (100K chunks ≈ 300 MB), and search grows linearly.
+- **Interface (M2):**
+  - `save(dir, chunks, vectors)` (builds `manifest.json` itself from config, so it always describes the run that produced the vectors), `load(dir) -> Index`, and `Index.search(q) -> [(chunk, score)]`.
+  - `search` returns **all** chunks sorted best-first, not a top-k, because D-015 filters afterwards (floor → relative cutoff → budget) and shouldn't have to guess a k up front.
+  - There's **no `add`**, because ingest always rebuilds the whole index (D-012), so nothing would ever call it.
 - **Likely reviewer questions:**
-  - *"How does this scale?"* Linearly. It's fine up to roughly 10⁵ chunks. Beyond that, FAISS IVF/HNSW trades a little recall for sub-linear search. The store sits behind a small interface (`add`, `search`, `save`, `load`), so swapping it is local to one module.
+  - *"How does this scale?"* Linearly. It's fine up to roughly 10⁵ chunks. Beyond that, FAISS IVF/HNSW trades a little recall for sub-linear search. The store sits behind a small interface (`save`, `load`, `search`), so swapping it is local to one module.
 
 ---
 
@@ -240,6 +251,12 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
 - **Decision:** A full rebuild on `ingest`, saved to `index/`. The metadata records the embedding model, chunking parameters and creation time.
 - **Why:** It's the standard offline-index/online-query split, and a small corpus makes full rebuilds cheap.
 - **Trade-offs accepted:** Staleness. Mitigation: `chat` warns if any source file is newer than the index.
+- **Load checks (M2):**
+  - `manifest.json` records `embed_model`, `chunk_size`, `overlap` and `created_at`.
+  - **Refuse** to load if `embed_model` differs from config: vectors from a different model live in a different space, so search would be meaningless.
+  - **Warn only** if the chunk parameters differ: the index is stale but still correct.
+  - **Raise** if `len(vectors) != len(chunks)`: row *i* must be chunk *i*, and a half-written or hand-edited index would otherwise give wrong source labels with no error.
+  - Files are written only after every embedding has succeeded.
 - **Likely reviewer questions:**
   - *"What happens if I edit a file?"* Re-run `ingest`, and chat warns you if you forget. Incremental indexing by content hash is the upgrade path.
 
@@ -330,7 +347,7 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
 ### D-018: Code layout: a package with one module per stage
 - **Status:** accepted
 - **Options considered:**
-  - **`rag_chat/` package** (`config`, `loaders`, `chunker`, `tokens`, `embedder`, `store`, `retriever`, `prompt`, `llm`, `cli`). Pros: each stage testable in isolation; the review walkthrough follows the data flow. Cons: more files.
+  - **`rag_chat/` package** (`config`, `loader`, `chunker`, `tokens`, `embedder`, `store`, `retriever`, `prompt`, `llm`, `cli`). Pros: each stage testable in isolation; the review walkthrough follows the data flow. Cons: more files.
   - **Single script.** Pros: fastest start. Cons: hard to test and hard to walk through.
   - **Ports/adapters, with interfaces for the LLM, embedder and store.** Pros: shows the system can swap components. Cons: abstractions with a single implementation are code to defend without benefit.
 - **Decision:** The package, using plain functions and small classes, with no abstract interfaces until a second implementation exists.
@@ -377,7 +394,7 @@ Facts marked **[verify]** come from documentation or memory and have not yet bee
 
 ### D-023: Loader policy for unreadable and empty files
 - **Status:** accepted (2026-11-21, M1)
-- **Context:** `loaders.py` finds `.md`/`.txt` files under a directory and returns `Document(path, text)`. It does **no retrieval** (that happens in `retriever.py`, against the index). A real `data/` folder can contain a Latin-1 file, a file with a BOM, or an empty placeholder.
+- **Context:** `loader.py` finds `.md`/`.txt` files under a directory and returns `Document(path, text)`. It does **no retrieval** (that happens in `retriever.py`, against the index). A real `data/` folder can contain a Latin-1 file, a file with a BOM, or an empty placeholder.
 - **Options considered:**
   - **Skip and warn.** Read as `utf-8-sig` (which strips a BOM). On `UnicodeDecodeError`, or text that is empty or only whitespace, skip the file, print a warning naming it, and continue. Pros: one bad file never blocks ingest, and nothing garbled reaches the index. Cons: a skipped file's content is missing until it's fixed (the warning makes that visible).
   - **`errors="replace"`.** Pros: never fails. Cons: bad bytes become `U+FFFD`, and the garbled text gets embedded, retrieved and shown to the LLM, all silently.

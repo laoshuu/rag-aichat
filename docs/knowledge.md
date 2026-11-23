@@ -14,6 +14,7 @@ Q&A collected during pairing sessions. Each entry answers one question, with con
 8. [How does overlap work in the chunker, and why do we sometimes need it?](#8-how-does-overlap-work-in-the-chunker-and-why-do-we-sometimes-need-it)
 9. [Exactly when is overlap triggered? (piece-by-piece trace)](#9-exactly-when-is-overlap-triggered)
 10. [Why is the chunk size 400 tokens?](#10-why-is-the-chunk-size-400-tokens)
+11. [Why does nomic need `search_document:` / `search_query:` prefixes?](#11-why-does-nomic-need-search_document--search_query-prefixes)
 
 ---
 
@@ -758,3 +759,54 @@ The chunk must fit the **LLM's** prompt budget, so it's counted with the Qwen to
 
 - Build `eval/questions.jsonl` and run 200 / 400 / 600 (D-019), then replace this entry's "reasoned" status with numbers.
 - Include questions whose answer spans two sentences, so the size and overlap effects are visible (see entry 8).
+
+---
+
+## 11. Why does nomic need `search_document:` / `search_query:` prefixes?
+
+**Where it shows up:** `DOC_PREFIX` / `QUERY_PREFIX` in [rag_chat/embedder.py](../rag_chat/embedder.py), D-007.
+
+### Short answer
+
+`nomic-embed-text` was trained on (question, answering passage) pairs, and each side carried a **task label** at the front. Training pulled each question's vector toward the vector of the passage that answers it. So at use time the label tells the model which **role** it is embedding:
+
+```text
+"search_query: how often does sync run?"                       <- embed as a question looking for an answer
+"search_document: Lumen Notes Guide > Sync\nLumen syncs ..."   <- embed as a passage that may answer questions
+```
+
+### What the prefix does NOT do
+
+- **It doesn't rewrite the text.** The question isn't turned into a statement, and the text is sent as-is. The prefix only changes *where the model places the vector*, putting each question near the passages that **answer** it instead of near text that **looks like** it.
+- **Both sides get a prefix, and they're different.** Document vectors are computed with `search_document:` at ingest. Query vectors are computed with `search_query:` at search time. Using the same prefix on both sides defeats the purpose.
+- **The prefix is never stored as text.** It exists only inside the HTTP request to Ollama. `chunks.json` holds clean text. The stored *vectors* were computed with the prefix, so the prefix is "baked into" `vectors.npy`, not written there.
+- **It never reaches the LLM.** `Chunk.full_text` goes into both the embed call and the prompt, which is why the prefix is added in the embedder and not in the chunker. It therefore doesn't count against the 6K budget or `Chunk.n_tokens`. It does count against nomic's 2,048-token input limit, but at ~4 tokens that doesn't matter.
+
+### Worked example (illustrative scores)
+
+```text
+query: "how often does sync run?"
+
+chunk A: "FAQ > Backup\nHow often does backup run? Nightly at 2am."   <- question-shaped, wrong topic
+chunk B: "Guide > Sync\nLumen syncs every 5 minutes over Wi-Fi."      <- the actual answer
+
+no prefixes:    A 0.61   B 0.58   <- surface similarity ("how often does ... run?") wins
+with prefixes:  A 0.49   B 0.66   <- "answers this question" wins
+```
+
+### What we actually measured (honest status)
+
+On the M0 3-document toy set (experiments/README.md §8), the scores were `0.670 / 0.456 / 0.443` with prefixes and `0.631 / 0.410 / 0.406` without. The ranking was the same and the gap similar. **That's not evidence either way.** We use the prefixes because the model card requires them. Whether they improve *our* retrieval is for the M4 eval (hit-rate@k with vs. without) to show.
+
+### Failure modes (all silent: no error, just worse rankings)
+
+1. **The query prefix is forgotten.** The query and the documents are embedded in different roles, so scores drop and rankings get noisier.
+2. **The same prefix is used on both sides.** This collapses back to "looks similar" matching.
+3. **A prefix changes after ingest.** The stored vectors no longer match new queries, so you have to re-run `ingest`.
+
+Because nobody would notice these by eye, `tests/test_embedder.py` checks that each prefix is actually sent.
+
+### Likely reviewer questions
+
+- *"Why not put the prefix on `Chunk.full_text`?"* Because `full_text` also goes into the LLM prompt. The prefix is an instruction to the embedding model only, so it belongs in the one module that talks to it.
+- *"Does the prefix make retrieval more accurate?"* That's what the model was trained for, and the model card says to use it. On our data it isn't proven yet. The eval will compare with vs. without.

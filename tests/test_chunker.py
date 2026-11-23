@@ -14,7 +14,7 @@ from rag_chat import config
 from rag_chat.chunker import (
     Piece, Section, _overlap, _pack, _pieces, _scan, _split_sentences, chunk,
 )
-from rag_chat.loaders import Document
+from rag_chat.loader import Document
 from rag_chat.tokens import count
 
 ROOT = Path(__file__).resolve().parent.parent
