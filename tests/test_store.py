@@ -46,6 +46,17 @@ def test_save_rejects_mismatched_lengths_and_writes_nothing(tmp_path):
 
 # --- search ------------------------------------------------------------------
 
+def test_crash_mid_save_leaves_no_loadable_index(saved, monkeypatch):
+    # Old index exists; the new save dies after vectors.npy, before chunks.json.
+    def boom(*a, **k):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(store.json, "dump", boom)
+    with pytest.raises(KeyboardInterrupt):
+        store.save(saved, CHUNKS, VECTORS, saved.parent)
+    with pytest.raises(FileNotFoundError, match="ingest"):
+        store.load(saved)                         # not old chunks + new vectors
+
+
 def test_known_vector_ranks_first_and_all_chunks_returned(saved):
     index = store.load(saved)
     q = np.array([0.0, 1.0, 0.0], dtype=np.float32)     # points exactly at chunk 1

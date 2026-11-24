@@ -28,6 +28,10 @@ def save(dir: Path, chunks: list[Chunk], vectors: np.ndarray, data_dir: Path) ->
     if len(chunks) != len(vectors):    # caller bug: fail before writing anything
         raise ValueError(f"Length Mismatch: {len(chunks)} chunks but {len(vectors)} vectors")
     dir.mkdir(parents=True, exist_ok=True)
+    # Wipe the old index first; manifest is written LAST, so a crash mid-save leaves
+    # no manifest and load() says "run ingest" instead of mixing old and new files.
+    for name in ("manifest.json", "vectors.npy", "chunks.json"):
+        (dir / name).unlink(missing_ok=True)
     np.save(dir / "vectors.npy", vectors)
     with (dir / "chunks.json").open('w', encoding="utf-8") as f:
         json.dump([asdict(c) for c in chunks], f, indent=2, ensure_ascii=False)
