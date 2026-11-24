@@ -39,6 +39,6 @@ EMBED_BATCH_SIZE = 64
 
 # --- Query ---------------------------------------------------
 QUERY_WEIGHT = 0.8
-SCORE_FLOOR = 0.5
-SCORE_DELTA = 0.2
+SCORE_FLOOR = 0.60     # tuned on eval/ (D-015): weakest answerable top score is 0.654
+SCORE_DELTA = 0.10     # tuned on eval/: recall 1.00 at ~5.7 chunks (0.20: 6.6)
 MAX_CHUNKS = 8

@@ -1,5 +1,6 @@
 """Tests for rag_chat.store (D-008, D-012). No Ollama: hand-made vectors."""
 import json
+import os
 
 import numpy as np
 import pytest
@@ -19,7 +20,7 @@ VECTORS = np.eye(3, dtype=np.float32)        # row i = [0..1..0], norm 1
 @pytest.fixture
 def saved(tmp_path):
     index_dir = tmp_path / "index"
-    store.save(index_dir, CHUNKS, VECTORS)
+    store.save(index_dir, CHUNKS, VECTORS, tmp_path)
     return index_dir
 
 
@@ -39,7 +40,7 @@ def test_round_trip_keeps_chunks_vectors_and_manifest(saved):
 def test_save_rejects_mismatched_lengths_and_writes_nothing(tmp_path):
     index_dir = tmp_path / "index"
     with pytest.raises(ValueError):
-        store.save(index_dir, CHUNKS, VECTORS[:2])
+        store.save(index_dir, CHUNKS, VECTORS[:2], tmp_path)
     assert not index_dir.exists()
 
 
@@ -92,3 +93,14 @@ def test_vector_chunk_count_mismatch_raises(saved):
 def test_index_files_are_inspectable_json(saved):
     chunks = json.loads((saved / "chunks.json").read_text(encoding="utf-8"))
     assert chunks[0]["heading_path"] == ["Lumen Notes Guide", "Sync"]
+
+
+def test_source_edited_after_ingest_warns(saved, tmp_path, capsys):
+    store.load(saved)
+    assert "changed" not in capsys.readouterr().err     # fresh index: quiet
+    doc = tmp_path / "notes.md"
+    doc.write_text("# edited later")
+    later = (saved / "manifest.json").stat().st_mtime + 10
+    os.utime(doc, (later, later))
+    store.load(saved)                                   # still loads, but warns
+    assert "re-run ingest" in capsys.readouterr().err

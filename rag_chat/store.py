@@ -24,7 +24,7 @@ class Index:
         return [(self.chunks[i], float(scores[i])) for i in order]
 
 # ---------------------------------------------------------------- write
-def save(dir: Path, chunks: list[Chunk], vectors: np.ndarray) -> None:
+def save(dir: Path, chunks: list[Chunk], vectors: np.ndarray, data_dir: Path) -> None:
     if len(chunks) != len(vectors):    # caller bug: fail before writing anything
         raise ValueError(f"Length Mismatch: {len(chunks)} chunks but {len(vectors)} vectors")
     dir.mkdir(parents=True, exist_ok=True)
@@ -37,6 +37,7 @@ def save(dir: Path, chunks: list[Chunk], vectors: np.ndarray) -> None:
             "chunk_size":  config.CHUNK_SIZE,
             "overlap":     config.OVERLAP,
             "n_chunks":    len(chunks),
+            "data_dir":    str(data_dir.resolve()),     # for the staleness warning on load
             "created_at":  datetime.now().isoformat(),
         }, f, indent=2)
 
@@ -53,6 +54,12 @@ def load(dir: Path) -> Index:
     # 2. WARN: stale chunking, but search is still correct
     if (manifest["chunk_size"], manifest["overlap"]) != (config.CHUNK_SIZE, config.OVERLAP):
         print(f"warning: index chunked with chunk_size = {manifest['chunk_size']}, overlap = {manifest['overlap']}; re-run ingest to apply", file=sys.stderr)
+
+    # 2b. WARN: a source file changed after ingest (D-012 staleness)
+    built = (dir / "manifest.json").stat().st_mtime
+    data  = Path(manifest.get("data_dir", ""))
+    if data.is_dir() and any(f.stat().st_mtime > built for f in data.rglob("*") if f.suffix in (".md", ".txt")):
+        print(f"warning: files in {data} changed after the index was built; re-run ingest", file=sys.stderr)
 
     vectors = np.load(dir / "vectors.npy")        # allow_pickle stays False (default)
     chunks  = [Chunk(**d) for d in json.loads((dir / "chunks.json").read_text(encoding="utf-8"))]

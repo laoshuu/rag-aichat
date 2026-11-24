@@ -36,7 +36,7 @@ All design decisions are recorded in [`docs/decisions.md`](docs/decisions.md) as
 
 **Current phase: building.** Discuss each decision in the context of the component being built, not in the abstract. Decisions stay flexible: when implementation shows a better option, raise it, discuss it, then update the entry. Keep the `[verify]` facts on the list and confirm each one when its component is built.
 
-Summary: Python · Ollama · our own pipeline (no framework) · qwen2.5:7b-instruct · nomic-embed-text · NumPy brute-force store · fixed 6,144-token budget with exact Qwen tokenizer counts · heading-aware ~400-token chunks · weighted current+previous query vector · relevance-filtered best-first selection (budget is a ceiling) · sliding-window history · CLI with streaming and a source list · pytest + retrieval eval · venv + requirements.txt · public Markdown docs + fictional `.txt` notes.
+Summary: Python · Ollama · our own pipeline (no framework) · qwen2.5:7b-instruct · nomic-embed-text · NumPy brute-force store · fixed 6,144-token budget with exact Qwen tokenizer counts (prompt hard limit 5,120) · heading-aware ~400-token chunks · weighted current+previous query vector · relevance-filtered best-first selection (budget is a ceiling) · sliding-window history · CLI with streaming and a source list · pytest + retrieval eval · venv + requirements.txt · public Markdown docs + fictional `.txt` notes.
 
 ## Conventions
 

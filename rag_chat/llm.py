@@ -15,13 +15,7 @@ def stream(messages: list[dict], expected: int) -> Iterator[str]:
         "options":  {"num_ctx": config.TOT_CONTEXT_LENGTH,     # 6,144 on every request
                      "num_predict": config.ANS_LENGTH},        # 1,024: the answer slot
     }
-    try:
-        resp = requests.post(URL, json=body, stream=True, timeout=120)  # per-read timeout; prefill ≤ ~19 s
-    except requests.ConnectionError:
-        raise RuntimeError("Ollama not reachable. Run `ollama serve`.")
-    if resp.status_code == 404:
-        raise RuntimeError(f"Model {config.CHAT_MODEL} not found. Run `ollama pull {config.CHAT_MODEL}`.")
-    resp.raise_for_status()
+    resp = _post(body, stream=True)
 
     with resp:
         for line in resp.iter_lines():            # NDJSON: one JSON object per line
@@ -34,6 +28,20 @@ def stream(messages: list[dict], expected: int) -> Iterator[str]:
                 _check(msg, expected)             # last line carries the stats
                 return
             yield msg["message"]["content"]       # a few characters at a time
+
+def warm_up() -> None:
+    # Empty messages = load the model and return. Same num_ctx as stream(), or Ollama reloads it.
+    _post({"model": config.CHAT_MODEL, "messages": [], "options": {"num_ctx": config.TOT_CONTEXT_LENGTH}})
+
+def _post(body: dict, stream: bool = False) -> requests.Response:
+    try:
+        resp = requests.post(URL, json=body, stream=stream, timeout=120)  # per-read timeout; prefill ≤ ~19 s
+    except requests.ConnectionError:
+        raise RuntimeError("Ollama not reachable. Run `ollama serve`.")
+    if resp.status_code == 404:
+        raise RuntimeError(f"Model {config.CHAT_MODEL} not found. Run `ollama pull {config.CHAT_MODEL}`.")
+    resp.raise_for_status()
+    return resp
 
 def _check(final: dict, expected: int):
     # D-010 detection: our exact count vs what Ollama actually processed

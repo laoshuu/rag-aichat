@@ -1,0 +1,15 @@
+{"id": "install", "turns": [{"q": "How do I install MkDocs?", "expect": ["mkdocs/user-guide/installation.md", "mkdocs/getting-started.md"]}]}
+{"id": "deploy", "turns": [{"q": "How do I deploy my documentation to GitHub Pages?", "expect": ["mkdocs/user-guide/deploying-your-docs.md"]}]}
+{"id": "strict", "turns": [{"q": "What does the strict setting do?", "expect": ["mkdocs/user-guide/configuration.md#strict"]}]}
+{"id": "css", "turns": [{"q": "How do I add a custom CSS file to my site?", "expect": ["mkdocs/user-guide/configuration.md#extra_css", "mkdocs/user-guide/customizing-your-theme.md"]}]}
+{"id": "plugin-event", "turns": [{"q": "Which plugin event runs once before the build starts?", "expect": ["mkdocs/dev-guide/plugins.md"]}]}
+{"id": "translate", "turns": [{"q": "How do I use a theme in another language?", "expect": ["mkdocs/user-guide/localizing-your-theme.md", "mkdocs/dev-guide/translations.md"]}]}
+{"id": "free-devices", "turns": [{"q": "How many devices can a Free account sync?", "expect": ["lumen_guide.md#Devices"]}]}
+{"id": "launch", "turns": [{"q": "When is the Lumen 4.0 launch?", "expect": ["team_notes.txt"]}]}
+{"id": "refund", "turns": [{"q": "Can a monthly Pro plan be refunded after three weeks?", "expect": ["support_playbook.txt"]}]}
+{"id": "conflicts-followup", "turns": [{"q": "How does Lumen handle sync conflicts?", "expect": ["lumen_guide.md#Conflicts"]}, {"q": "What should support ask first about them?", "expect": ["support_playbook.txt"]}]}
+{"id": "nav-followup", "turns": [{"q": "What is the nav setting used for?", "expect": ["mkdocs/user-guide/configuration.md#nav"]}, {"q": "What happens to pages that are not listed in it?", "expect": ["mkdocs/user-guide/configuration.md"]}]}
+{"id": "theme-followup", "turns": [{"q": "Which themes come built in with MkDocs?", "expect": ["mkdocs/user-guide/choosing-your-theme.md"]}, {"q": "How do I customize it?", "expect": ["mkdocs/user-guide/customizing-your-theme.md"]}]}
+{"id": "topic-switch", "turns": [{"q": "How do I turn on sync in Lumen?", "expect": ["lumen_guide.md#Sync"]}, {"q": "How much does Lumen Pro cost?", "expect": ["lumen_guide.md#Pricing", "team_notes.txt"]}, {"q": "How do I write a MkDocs plugin?", "expect": ["mkdocs/dev-guide/plugins.md"]}]}
+{"id": "offtopic", "turns": [{"q": "What is the capital of Australia?", "expect": []}, {"q": "How do I configure Kubernetes autoscaling?", "expect": []}, {"q": "Give me a recipe for banana bread.", "expect": []}]}
+{"id": "ondomain-unanswerable", "turns": [{"q": "Does Lumen have an Android app?", "expect": []}]}

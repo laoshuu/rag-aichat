@@ -17,7 +17,7 @@ def cmd_ingest(args) -> int:
         raise RuntimeError(f"No .md/.txt content found under {args.data_dir}.")
     print(f"{len(docs)} documents -> {len(chunks)} chunks")
     vectors = embedder.embed_documents([c.full_text for c in chunks])    # full_text: prefix+body
-    store.save(config.INDEX_DIR, chunks, vectors)               # only after ALL embeds succeed
+    store.save(config.INDEX_DIR, chunks, vectors, Path(args.data_dir))             # only after ALL embeds succeed
     print(f"Index written to {config.INDEX_DIR} in {time.perf_counter() - t0:.1f}s")
     return 0
 
@@ -35,6 +35,8 @@ def cmd_search(args) -> int:
 def cmd_chat(args) -> int:
     index   = store.load(config.INDEX_DIR)        # 3 checks happen here
     history = []          # owned by cmd_chat, lives for the whole session: [(question, answer)]
+    print("Loading model...")
+    llm.warm_up()         # load weights now, so the first answer isn't slow
     print("Ask a question. /reset clears history, /quit exits.")
     while True:
         try:
@@ -61,9 +63,13 @@ def cmd_chat(args) -> int:
             continue
 
         pieces = []
-        for piece in llm.stream(messages, expected):     # D-020: print as tokens arrive
-            print(piece, end="", flush=True)
-            pieces.append(piece)
+        try:
+            for piece in llm.stream(messages, expected):     # D-020: print as tokens arrive
+                print(piece, end="", flush=True)
+                pieces.append(piece)
+        except KeyboardInterrupt:                 # Ctrl-C mid-answer: stop this answer, keep the session
+            print("\n[interrupted]")
+            continue                              # a half answer stays out of history
         print()
 
         print("\nSources:")                       # D-017: chunks that were in the prompt
